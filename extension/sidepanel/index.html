@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ebb</title>
+    <link rel="stylesheet" href="panel.css" />
+    <script type="module" src="panel.js"></script>
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <img src="../icons/icon32.png" alt="" width="20" height="20" />
+        <span>Ebb</span>
+      </div>
+      <p class="summary" id="summary" aria-live="polite"></p>
+      <button type="button" id="pause" class="chip" aria-pressed="false" title="Pause Ebb">Pause</button>
+    </header>
+
+    <div id="banners"></div>
+
+    <nav class="tabs" role="tablist" aria-label="Ebb views">
+      <button type="button" role="tab" data-view="now" aria-selected="true">Now</button>
+      <button type="button" role="tab" data-view="later" aria-selected="false">Later <span class="count" id="later-count"></span></button>
+      <button type="button" role="tab" data-view="library" aria-selected="false">Library</button>
+      <button type="button" role="tab" data-view="ledger" aria-selected="false">Ledger</button>
+      <button type="button" role="tab" data-view="settings" aria-selected="false">Settings</button>
+    </nav>
+
+    <main>
+      <section id="view-now" data-view="now" role="tabpanel"></section>
+      <section id="view-later" data-view="later" role="tabpanel" hidden></section>
+      <section id="view-library" data-view="library" role="tabpanel" hidden>
+        <label class="search">
+          <span class="visually-hidden">Search the Library</span>
+          <input type="search" id="library-q" placeholder="Search titles, sites and page text" autocomplete="off" />
+        </label>
+        <div id="library-list"></div>
+      </section>
+      <section id="view-ledger" data-view="ledger" role="tabpanel" hidden></section>
+      <section id="view-settings" data-view="settings" role="tabpanel" hidden></section>
+    </main>
+
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

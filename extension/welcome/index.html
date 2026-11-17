@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Welcome to Ebb</title>
+    <link rel="icon" href="../icons/icon32.png" />
+    <link rel="stylesheet" href="welcome.css" />
+    <script type="module" src="welcome.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <img src="../icons/icon128.png" alt="" width="64" height="64" />
+        <h1>Ebb keeps your tabs calm</h1>
+        <p class="lead">
+          Tabs you leave alone ebb away in stages. You never lose a page, and you never have to sort anything.
+        </p>
+      </header>
+
+      <ol class="stages">
+        <li>
+          <span class="stage-name">Resting</span>
+          <p>After a while unused, a tab is unloaded in place. It stays in your tab bar and reloads when you click it.</p>
+        </li>
+        <li>
+          <span class="stage-name">Shelf</span>
+          <p>Later, it moves into a collapsed <strong>Shelf</strong> group at the end of the tab bar. One click brings it back. In a window with more than 15 tabs, the ones you used least recently move here sooner, while you’re away.</p>
+        </li>
+        <li>
+          <span class="stage-name">Library</span>
+          <p>Much later, it closes into Ebb’s Library with your place on the page and a snippet of its text, so you can search for it and pick up where you were.</p>
+        </li>
+      </ol>
+
+      <section class="facts">
+        <div>
+          <h2>Only active time counts</h2>
+          <p>The clock runs only while you are using Chrome, so a weekend away doesn’t empty your tabs. Tabs you keep coming back to stay much longer.</p>
+        </div>
+        <div>
+          <h2>Some tabs are never touched</h2>
+          <p>The tab you’re on, pinned tabs, tabs playing sound, tabs with unsaved typing, and web apps like mail, calendar and chat.</p>
+        </div>
+        <div>
+          <h2>Tasks, not piles</h2>
+          <p>Ebb groups tabs by what you were doing: a search, or a site you went to. When a confirmation page says you’re done, it offers to tuck that task away.</p>
+        </div>
+        <div>
+          <h2>A Later lane</h2>
+          <p>When one page spawns a pile of background tabs, the extra links wait in a Later list instead of crowding your tab bar.</p>
+        </div>
+      </section>
+
+      <section class="setup">
+        <h2>How quickly should tabs ebb?</h2>
+        <div class="pace" role="radiogroup" aria-label="Pace">
+          <label><input type="radio" name="pace" value="gentle" /> <strong>Gentle</strong> <span>tabs stay twice as long</span></label>
+          <label><input type="radio" name="pace" value="balanced" checked /> <strong>Balanced</strong> <span>unused tabs rest after about 30 minutes of browsing</span></label>
+          <label><input type="radio" name="pace" value="brisk" /> <strong>Brisk</strong> <span>tabs stay half as long</span></label>
+        </div>
+        <div class="actions">
+          <button type="button" id="open" class="btn">Open Ebb</button>
+          <span class="hint">Tip: pin Ebb from the puzzle-piece menu so it’s one click away.</span>
+        </div>
+      </section>
+
+      <footer>Everything Ebb keeps stays on this device. It makes no network requests.</footer>
+    </main>
+  </body>
+</html>

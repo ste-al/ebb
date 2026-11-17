@@ -1,0 +1,21 @@
+{
+  "name": "ebb",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A browser extension that lets tabs you leave alone quietly ebb away, without losing anything.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/unit/*.test.js test/engine/*.test.js",
+    "test:e2e": "node --test --test-concurrency=1 test/e2e/*.test.js",
+    "check": "node scripts/check-extension.js",
+    "pack": "node scripts/pack.js",
+    "icons": "python3 scripts/make-icons.py"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.2.8",
+    "puppeteer-core": "^25.18.1"
+  }
+}
