@@ -19,13 +19,16 @@ export function isWebUrl(url) {
   return typeof url === 'string' && /^https?:\/\//i.test(url);
 }
 
-const TRACKING_PARAM = /^(utm_[a-z]+|fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid|ref_src|ref_url)$/i;
+const TRACKING_PARAM = /^(utm_[a-z]+|fbclid|gclid|dclid|msclkid|mc_cid|mc_eid|igshid|ref_src|ref_url|_hsenc|_hsmi|si)$/i;
 
-/** URL without fragment and common tracking parameters, used to match the same page. */
+/**
+ * URL without its fragment and common tracking parameters, used to tell whether two
+ * addresses are the same page. Fragments that are app routes (#/inbox, #!/item) are kept.
+ */
 export function normalizeUrl(url) {
   try {
     const u = new URL(url);
-    u.hash = '';
+    if (!/^#!?\//.test(u.hash)) u.hash = '';
     for (const key of [...u.searchParams.keys()]) {
       if (TRACKING_PARAM.test(key)) u.searchParams.delete(key);
     }

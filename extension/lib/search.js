@@ -3,6 +3,7 @@
 
 const ENGINES = [
   { name: 'Google', host: /(^|\.)google\.[a-z]{2,3}(\.[a-z]{2})?$/, path: /^\/search\/?$/, params: ['q'] },
+  { name: 'Google Scholar', host: /^scholar\.google\.[a-z]{2,3}(\.[a-z]{2})?$/, path: /^\/scholar\/?$/, params: ['q'] },
   { name: 'Bing', host: /(^|\.)bing\.com$/, path: /^\/search\/?$/, params: ['q'] },
   { name: 'DuckDuckGo', host: /(^|\.)duckduckgo\.com$/, path: /^\/(html\/?)?$/, params: ['q'] },
   { name: 'Brave Search', host: /^search\.brave\.com$/, path: /^\/search\/?$/, params: ['q'] },

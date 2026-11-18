@@ -84,6 +84,7 @@ export function protection(tab, record, ctx) {
   if (tab.active) return 'in view';
   if (tab.pinned) return 'pinned';
   if (tab.audible) return 'playing';
+  if (tab.autoDiscardable === false) return 'kept active'; // another tool asked Chrome to keep it loaded
   const url = tab.url || tab.pendingUrl || record?.url || '';
   if (!isWebUrl(url)) return 'not a web page';
   if (record?.keep === 'always') return 'kept';

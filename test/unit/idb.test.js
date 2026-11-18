@@ -24,3 +24,29 @@ test('the IndexedDB repo stores, queries and prunes records', async () => {
   assert.equal(await repo.count('library'), 0);
   assert.equal(await repo.count('later'), 1, 'clearing one store leaves the others');
 });
+
+test('upgrading from version 1 keeps the data and adds the new store and index', async () => {
+  const name = `ebb-upgrade-${Date.now()}`;
+  await new Promise((resolve, reject) => {
+    const request = indexedDB.open(name, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      const s = db.createObjectStore('library', { keyPath: 'id' });
+      for (const index of ['archivedAt', 'url', 'batchId', 'huntId']) s.createIndex(index, index);
+      db.createObjectStore('later', { keyPath: 'id' }).createIndex('savedAt', 'savedAt');
+      db.createObjectStore('ledger', { keyPath: 'id' }).createIndex('at', 'at');
+      s.put({ id: 'old', url: 'https://a.example/', archivedAt: 1 });
+    };
+    request.onsuccess = () => {
+      request.result.close();
+      resolve();
+    };
+    request.onerror = () => reject(request.error);
+  });
+  const repo = openRepo({ indexedDB, IDBKeyRange, name });
+  assert.equal((await repo.get('library', 'old')).url, 'https://a.example/');
+  await repo.put('library', { id: 'new', url: 'https://b.example/', key: 'https://b.example/', archivedAt: 2 });
+  assert.deepEqual((await repo.findBy('library', 'key', 'https://b.example/')).map((r) => r.id), ['new']);
+  await repo.put('snapshots', { id: 'https://b.example/', excerpt: 'text' });
+  assert.equal((await repo.get('snapshots', 'https://b.example/')).excerpt, 'text');
+});

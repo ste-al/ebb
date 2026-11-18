@@ -37,6 +37,7 @@ test('lifetimes: protections, in order', () => {
   assert.equal(protection(tab({ active: true }), {}, ctx), 'in view');
   assert.equal(protection(tab({ pinned: true }), {}, ctx), 'pinned');
   assert.equal(protection(tab({ audible: true }), {}, ctx), 'playing');
+  assert.equal(protection(tab({ autoDiscardable: false }), {}, ctx), 'kept active');
   assert.equal(protection(tab({ url: 'chrome://settings' }), {}, ctx), 'not a web page');
   assert.equal(protection(tab(), { keep: 'always' }, ctx), 'kept');
   assert.equal(protection(tab(), { keepUntil: 2000 }, ctx), 'kept for now');
@@ -57,10 +58,22 @@ test('mission: confirmation pages in several languages', () => {
     { url: 'https://boutique.example.fr/fin', headings: ['Merci pour votre commande'] },
     { url: 'https://tienda.example.es/fin', headings: ['¡Gracias por tu pedido!'] },
     { url: 'https://pay.example/payment/success', title: 'Payment' },
+    { url: 'https://www.booking.example/confirmation.html', headings: ['Thanks, Alex! Your booking in Lisbon is confirmed.'] },
+    { url: 'https://shop.example/account', headings: ['Your order #A-1234 has been placed'] },
+    { url: 'https://www.amazon.example/gp/buy/thankyou/handlers/display.html', title: 'Amazon' },
+    { url: 'https://events.example/e/7', headings: ['You’re registered!'] },
+    { url: 'https://shop.example/x', headings: ['Order confirmation'] },
+    { url: 'https://www.alza.cz/x', headings: ['Objednávka byla úspěšně odeslána'] },
+    { url: 'https://hotel.example/x', headings: ['Thank you for your booking'] },
+    { url: 'https://boutique.example.fr/x', headings: ['Votre commande a été enregistrée'] },
+    { url: 'https://tienda.example.es/x', headings: ['Tu pedido ha sido confirmado'] },
   ];
   for (const signals of yes) assert.ok(detectMission(signals), JSON.stringify(signals));
   assert.equal(detectMission(yes[2]).kind, 'booking');
   assert.equal(detectMission(yes[3]).kind, 'application');
+  assert.equal(detectMission(yes[9]).kind, 'booking');
+  assert.equal(detectMission(yes[12]).kind, 'registration');
+  assert.equal(detectMission(yes[15]).kind, 'booking', 'a booking thank-you is not an order');
 });
 
 test('mission: ordinary pages are not mistaken for confirmations', () => {
@@ -70,6 +83,9 @@ test('mission: ordinary pages are not mistaken for confirmations', () => {
     { url: 'https://blog.example/how-to-track-your-order', title: 'How to find your order number', hasReference: true },
     { url: 'https://site.example/thank-you', title: 'Thanks for subscribing' },
     { url: 'not a url', title: 'Thank you for your order' },
+    { url: 'https://shop.example/checkout', headings: ['Your order will be confirmed by email'] },
+    { url: 'https://help.example/orders', headings: ['How to view your order confirmation'] },
+    { url: 'https://shop.example/orders', headings: ['Orders placed before 2 pm ship today'] },
   ];
   for (const signals of no) assert.equal(detectMission(signals), null, JSON.stringify(signals));
 });

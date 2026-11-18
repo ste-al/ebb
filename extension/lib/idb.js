@@ -2,15 +2,21 @@
 // Everything stays on this device.
 
 const DB_NAME = 'ebb';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
-function upgrade(db) {
-  if (!db.objectStoreNames.contains('library')) {
-    const s = db.createObjectStore('library', { keyPath: 'id' });
-    s.createIndex('archivedAt', 'archivedAt');
-    s.createIndex('url', 'url');
-    s.createIndex('batchId', 'batchId');
-    s.createIndex('huntId', 'huntId');
+/**
+ * Stores
+ *   library    closed tabs; `key` is the normalized URL, so the same page is kept once
+ *   later      links waiting to be read
+ *   ledger     one event per action, for the weekly numbers
+ *   snapshots  text snippets of open pages, by normalized URL (kept out of the hot state)
+ */
+function upgrade(db, tx) {
+  const library = db.objectStoreNames.contains('library')
+    ? tx.objectStore('library')
+    : db.createObjectStore('library', { keyPath: 'id' });
+  for (const index of ['archivedAt', 'url', 'batchId', 'huntId', 'key']) {
+    if (!library.indexNames.contains(index)) library.createIndex(index, index);
   }
   if (!db.objectStoreNames.contains('later')) {
     const s = db.createObjectStore('later', { keyPath: 'id' });
@@ -19,6 +25,9 @@ function upgrade(db) {
   if (!db.objectStoreNames.contains('ledger')) {
     const s = db.createObjectStore('ledger', { keyPath: 'id' });
     s.createIndex('at', 'at');
+  }
+  if (!db.objectStoreNames.contains('snapshots')) {
+    db.createObjectStore('snapshots', { keyPath: 'id' });
   }
 }
 
@@ -44,7 +53,7 @@ export function openRepo({ indexedDB = globalThis.indexedDB, IDBKeyRange = globa
   const db = () =>
     (opening ||= new Promise((resolve, reject) => {
       const request = indexedDB.open(name, DB_VERSION);
-      request.onupgradeneeded = () => upgrade(request.result);
+      request.onupgradeneeded = () => upgrade(request.result, request.transaction);
       request.onsuccess = () => {
         const d = request.result;
         d.onversionchange = () => {
@@ -90,6 +99,11 @@ export function openRepo({ indexedDB = globalThis.indexedDB, IDBKeyRange = globa
       const { tx, os } = await store(name, 'readwrite');
       os.clear();
       await done(tx);
+    },
+    /** Records whose `index` value equals `value`. */
+    async findBy(name, index, value) {
+      const { os } = await store(name);
+      return result(os.index(index).getAll(value));
     },
     async count(name) {
       const { os } = await store(name);

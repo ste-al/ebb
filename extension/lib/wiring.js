@@ -31,7 +31,7 @@ export function wireEvents(engine, api, { onError = () => {} } = {}) {
   // Single-page apps change URL without a load; treat that like a navigation that just finished.
   api.webNavigation.onHistoryStateUpdated.addListener((details) => {
     if (details.frameId !== 0) return;
-    run('onNavCommitted', details).then(() => engine.spawn(() => engine.pageLoaded(details.tabId)));
+    run('onNavCommitted', { ...details, sameDocument: true }).then(() => engine.spawn(() => engine.pageLoaded(details.tabId)));
   });
   api.webNavigation.onCreatedNavigationTarget.addListener((details) => run('onNavCreatedTarget', details));
 

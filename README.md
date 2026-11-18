@@ -17,7 +17,7 @@ Nothing is lost, and there is nothing to organize.</p>
 
 Most tab tools ask you to do the work: save sessions, sort groups, decide what to close. Ebb takes the opposite approach. It watches which tabs you actually use and lets the rest drift out of the way in reversible stages, at moments when you won't notice, and it keeps your place on every page so that coming back is one click.
 
-**Status:** v0.1 for Chrome 116+ (Manifest V3). Other Chromium browsers may work but are untested. Not on the Chrome Web Store yet; install it from source (below).
+**Status:** v0.2 for Chrome 116+ (Manifest V3). See the [changelog](CHANGELOG.md). Other Chromium browsers may work but are untested. Not on the Chrome Web Store yet; install it from source (below).
 
 ## What it does
 
@@ -27,7 +27,7 @@ Most tab tools ask you to do the work: save sessions, sort groups, decide what t
 
 **Lifetimes adapt.** Tabs you come back to live longer: a tab you opened once rests after 30 active minutes, one you returned to after 2 hours, and one you keep returning to after 6 hours. Search results, news and social posts fade twice as fast; documents and references last twice as long. Sites you often bring back automatically get 2–3× longer lifetimes. Pick a pace: gentle, balanced or brisk.
 
-**Moves happen at natural boundaries.** Unloading can happen any time, since nothing visibly moves. Shelving and archiving wait until you step away or switch to another app, and happen at most 25 tabs at a time.
+**Moves happen at natural boundaries.** Unloading can happen any time, since nothing visibly moves. Shelving and archiving wait until you step away (three minutes without input) or switch to another app, and happen at most 25 tabs at a time. The first time Ebb does this, it leaves a short note explaining what happened for when you come back.
 
 **Tasks, not piles ("hunts").** Ebb groups tabs by what you were doing, with no manual grouping. A search starts a task named by its query (refining the query keeps the same task), tabs opened from it join it, and typing an address starts a task named by its site.
 
@@ -36,6 +36,8 @@ Most tab tools ask you to do the work: save sessions, sort groups, decide what t
 **A Later lane.** When one page spawns a pile of background tabs (more than 4 within 5 minutes by default), the extra links go to a Later list instead of your tab bar. You get a small note on the page with an *Open now* button. You can also right-click any link and choose *Save link to Later*. Unread links move to the Library after two weeks.
 
 **Resume, don't restore.** After a browser restart, Ebb recognizes your restored tabs and keeps their tasks. Tabs that were unloaded stay unloaded instead of all loading at once. Tabs that didn't come back are saved to the Library. A *Welcome back* card lets you focus on one task (shelving the rest) or reopen one.
+
+**Find anything again.** Type <kbd>ebb</kbd>, a space and a few words in the address bar to search the Library and the Later list, by title, address or page text. Pick a result and it opens where you were on the page; if it's already open, Ebb switches to it.
 
 **A regret ledger.** Ebb counts every tab it tidies and every one you bring back, and shows you the rate: *"Ebb tidied 86 tabs and you brought back 4 (4.7%)."*
 
@@ -67,9 +69,9 @@ A welcome page explains the stages and lets you pick a pace. To update, pull the
 
 There's nothing you have to do. When you want to look:
 
-- **Now** shows each window's tabs by task, with what happens to each tab next ("unloads in 12m", "Shelf in 3h"). Hover a tab to keep it, shelve it, send it to Later or close it into the Library. Click a task's ✓ to tuck the whole task away.
+- **Now** shows each window's tabs by task, with what happens to each tab next ("unloads in 12m", "Shelf in 3h"). Hover a tab to keep it, shelve it, send it to Later or close it into the Library (each with Undo). Click a task's ✓ to tuck the whole task away.
 - **Later** holds queued links. Click one to open it.
-- **Library** is searchable by title, address, task and page text. Click an item to bring it back. Recently closed tabs return with their back/forward history.
+- **Library** is searchable by title, address, task and page text, as is the address bar (<kbd>ebb</kbd> and a space). Click an item to bring it back. Recently closed tabs return with their back/forward history. Each page appears once; closing it again updates its entry.
 - **Ledger** shows the week's numbers, plus the sites Ebb now keeps longer because you bring them back.
 - **Settings** has the pace, the visible-tab budget, the Later lane, privacy options, a *Fresh start* (move everything unprotected to the Library as one undoable batch) and export/import.
 
@@ -86,7 +88,7 @@ You can change these at `chrome://extensions/shortcuts`. Right-click menus offer
 | Setting | Default |
 | --- | --- |
 | Pace | Balanced: a tab you opened once rests after 30 active minutes, moves to the Shelf after 3 hours and to the Library after 24 hours of active time |
-| Visible tabs per window | 15. Above this, the least recently used tabs move to the Shelf while you're away. Never in the first active hour after install, and never tabs used in the last 20 minutes. |
+| Visible tabs per window | 15 loose tabs (tabs in your own groups don't count). Above this, the least recently used tabs move to the Shelf while you're away. Never in the first active hour after install, and never tabs used in the last 20 minutes. |
 | Shelf | On. A tab stays on it at least an active hour before going to the Library. |
 | Later lane | Queue extras when one page opens more than 4 background tabs in 5 minutes; unread links move to the Library after 14 days |
 | Tuck-away offers | On |
@@ -95,7 +97,7 @@ You can change these at `chrome://extensions/shortcuts`. Right-click menus offer
 
 ## Privacy
 
-Ebb makes no network requests and has no analytics. Everything it keeps (tab records, the Library, Later, the ledger) stays in the extension's local storage on this device, and is removed when you uninstall it. Text snippets can be turned off in Settings. Export/import gives you all your data as a JSON file.
+Ebb makes no network requests and has no analytics. Everything it keeps (tab records, the Library, Later, the ledger) stays in the extension's local storage on this device, and is removed when you uninstall it. The address-bar search only looks through that same local data. Text snippets can be turned off in Settings, which also deletes the snippets kept for open tabs. Export/import gives you all your data as a JSON file.
 
 | Permission | Why Ebb needs it |
 | --- | --- |
@@ -110,6 +112,7 @@ Ebb makes no network requests and has no analytics. Everything it keeps (tab rec
 ## Known limitations
 
 - When Ebb closes a tab (to the Library, to Later, or when tucking a task away), Chrome lists it under *Recently closed* like any closed tab, so <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> may reopen a tab Ebb tidied rather than the one you just closed. This is one reason Ebb only moves tabs while you're away.
+- Recent Chrome versions save tab groups automatically, and sync them when you're signed in. Ebb removes the Shelf group itself when it empties, but if you close a window that has a Shelf, Chrome may keep a "Shelf" entry in its Tab groups menu. You can delete it there. Turning off *Use the Shelf* avoids tab groups entirely.
 - After a restart, tabs are matched to Ebb's records by address. A page that redirects as it loads may not be recognized, and its old record is saved to the Library instead.
 - Scroll restore is best effort. Pages that render late or use virtual scrolling may not land exactly where you were.
 - Confirmation pages are recognized by heuristics in English, Czech, German, French and Spanish.

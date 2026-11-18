@@ -173,6 +173,15 @@ h1 {
   outline-offset: 2px;
 }
 
+kbd {
+  font: inherit;
+  font-weight: 600;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--bg);
+}
+
 .hint {
   color: var(--muted);
   font-size: 14px;

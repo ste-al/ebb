@@ -1,23 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { setup, connect, FakeBrowser } from '../fakes/harness.js';
+import { setup, connect, nextSession } from '../fakes/harness.js';
 import { MIN, HOUR } from '../../extension/lib/util.js';
-
-/** Build the next browser session from the last one: same storage and Library, new tab ids. */
-function nextSession(previous, { restore }) {
-  const b = new FakeBrowser({ storage: previous.storageData, repo: previous.repo, firstId: 500, now: previous.time + 10 * HOUR });
-  const windowId = b.openWindow();
-  for (const { url, active = false } of restore) {
-    // Chrome restores these before Ebb's service worker starts, so no events reach Ebb.
-    const id = b.nextTabId++;
-    b.tabs.set(id, {
-      id, windowId, url, title: url, favIconUrl: '', active, pinned: false, audible: false, discarded: false,
-      groupId: -1, status: 'complete', incognito: false, page: b.pageFor(url),
-    });
-    b.windows.get(windowId).order.push(id);
-  }
-  return b;
-}
 
 test('after a restart, restored tabs keep their tasks, stay unloaded, and missing ones go to the Library', async () => {
   const t1 = await setup({ settings: { laterMode: 'off' } });

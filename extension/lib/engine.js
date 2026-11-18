@@ -32,9 +32,11 @@ const BATCH_VISIBLE_MS = 30 * MIN;
 export const SHELF_TITLE = 'Shelf';
 const SHELF_TITLE_RE = /^Shelf( · \d+)?$/;
 
+export const STATE_VERSION = 2;
+
 export function emptyState() {
   return {
-    version: 1,
+    version: STATE_VERSION,
     installedClock: 0,
     clock: { activeMs: 0, lastTickAt: null, focused: true, idle: 'active' },
     tabs: {}, // tabId -> record
@@ -52,16 +54,31 @@ export function emptyState() {
     hostMultAt: 0,
     lastDaily: 0,
     counts: { later: 0 },
+    intro: { shelf: false, library: false }, // first-time explanations already shown
+    introPending: null, // { kind, count }: an explanation waiting for you to come back
   };
 }
 
+/** Stored state of this or an older version, brought up to date (text snippets move out in load()). */
 function migrate(stored) {
   const base = emptyState();
-  if (!stored || typeof stored !== 'object' || stored.version !== 1) return base;
-  return { ...base, ...stored, clock: { ...base.clock, ...stored.clock }, counts: { ...base.counts, ...stored.counts } };
+  if (!stored || typeof stored !== 'object' || !(stored.version >= 1 && stored.version <= STATE_VERSION)) return base;
+  return {
+    ...base,
+    ...stored,
+    version: STATE_VERSION,
+    clock: { ...base.clock, ...stored.clock },
+    counts: { ...base.counts, ...stored.counts },
+    intro: { ...base.intro, ...stored.intro },
+  };
 }
 
+/** Never loaded (restored lazily) or unloaded: either way the tab holds no page right now. */
+const unloaded = (tab) => Boolean(tab && (tab.discarded || tab.status === 'unloaded'));
+
 const isShelfTitle = (title) => SHELF_TITLE_RE.test(String(title || ''));
+const XML_ENTITIES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' };
+const xml = (text) => String(text).replace(/[&<>"']/g, (c) => XML_ENTITIES[c]);
 const finite = (n) => (Number.isFinite(Number(n)) ? Number(n) : 0);
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
@@ -75,7 +92,8 @@ export class Engine {
     this.pending = new Set();
     this.changed = false;
     this.persistTimer = null;
-    this.flushDelay = ports.flushDelayMs ?? 400;
+    this.flushDelay = ports.flushDelayMs ?? 1000;
+    this.introducing = false;
     this.lastBadge = null;
     this.expectedRemovals = new Set();
   }
@@ -129,6 +147,7 @@ export class Engine {
       const got = (await this.p.storage.get(['ebb:state', 'ebb:settings'])) || {};
       this.settings = withDefaults(got['ebb:settings']);
       this.state = migrate(got['ebb:state']);
+      if (got['ebb:state']?.version === 1) await this.moveSnippetsOut();
       await this.checkSession();
     })().finally(() => {
       this.loading = null;
@@ -138,6 +157,23 @@ export class Engine {
 
   touch() {
     this.changed = true;
+  }
+
+  /** Version 1 kept text snippets in every tab record, which made each save large. */
+  async moveSnippetsOut() {
+    const records = [
+      ...Object.values(this.state.tabs),
+      ...Object.values(this.state.limbo).flat().map((entry) => entry.rec),
+      ...Object.values(this.state.startup?.prev || {}).flat(),
+    ];
+    for (const rec of records) {
+      if (rec.excerpt && isWebUrl(rec.url) && this.settings.captureText) {
+        await this.p.repo.put('snapshots', { id: normalizeUrl(rec.url), url: rec.url, excerpt: rec.excerpt, description: rec.description || '', at: this.now() });
+      }
+      delete rec.excerpt;
+      delete rec.description;
+    }
+    this.touch();
   }
 
   async flush() {
@@ -288,9 +324,7 @@ export class Engine {
       keepUntil: 0,
       dirty: false,
       freeze: null,
-      excerpt: '',
-      excerptUrl: '',
-      description: '',
+      excerptUrl: '', // the address whose text snippet is saved (in the snapshots store)
       signalsUrl: '',
       restFailedClock: null,
       fresh: true,
@@ -352,7 +386,7 @@ export class Engine {
     if (!was) return;
     delete rec.wasStage;
     this.touch();
-    if ((was === 'resting' || was === 'shelved') && !tab.active && !tab.discarded) {
+    if ((was === 'resting' || was === 'shelved') && !tab.active && !unloaded(tab)) {
       const d = await this.p.tabs.discard(tab.id);
       if (d) {
         if (d.id !== tab.id) this.replaceTabId(tab.id, d.id);
@@ -435,7 +469,10 @@ export class Engine {
   /** Browser start: tab ids changed, so keep the old records by URL and adopt restored tabs. */
   async startup() {
     const now = this.now();
-    if (this.state.startup && now < this.state.startup.adoptUntil) return;
+    if (this.state.startup) {
+      if (now < this.state.startup.adoptUntil) return;
+      await this.finishStartup(); // an earlier restart nobody ticked past: save its leftovers first
+    }
     const prev = {};
     const keep = (rec) => {
       if (isWebUrl(rec.url)) (prev[normalizeUrl(rec.url)] ||= []).push(rec);
@@ -474,7 +511,7 @@ export class Engine {
     const closedByHunt = {};
     for (const list of Object.values(startup.prev)) {
       for (const rec of list) {
-        await this.p.repo.put('library', this.libraryItem(rec, { reason: 'session-end', batchId: startup.batchId }));
+        await this.addToLibrary(await this.libraryItem(rec, { reason: 'session-end', batchId: startup.batchId }));
         const key = rec.huntId || '_';
         closedByHunt[key] = (closedByHunt[key] || 0) + 1;
       }
@@ -517,6 +554,8 @@ export class Engine {
     if (idleState !== 'active') {
       await this.lifecycle({ boundary: true });
       await this.maintainShelves();
+    } else {
+      this.maybeIntroduce();
     }
   }
 
@@ -527,7 +566,10 @@ export class Engine {
   async onFocus(windowId) {
     this.accrue();
     this.state.clock.focused = windowId !== -1;
-    if (windowId !== -1) this.state.clock.idle = 'active';
+    if (windowId !== -1) {
+      this.state.clock.idle = 'active';
+      this.maybeIntroduce();
+    }
   }
 
   /**
@@ -557,7 +599,7 @@ export class Engine {
       if (this.heldByGroup(tab, shelfIds) && STAGE_RANK[target] > STAGE_RANK.resting) target = 'resting';
       if (target === 'live') continue;
 
-      if (!tab.discarded) {
+      if (!unloaded(tab)) {
         const retryOk = rec.restFailedClock == null || this.activeMs - rec.restFailedClock >= REST_RETRY;
         if (rests > 0 && retryOk) {
           rests -= 1;
@@ -599,7 +641,7 @@ export class Engine {
       byWindow.get(t.windowId).push(t);
     }
     for (const list of byWindow.values()) {
-      const visible = list.filter((t) => !t.pinned && !shelfIds.has(t.groupId));
+      const visible = list.filter((t) => !t.pinned && !shelfIds.has(t.groupId) && !this.heldByGroup(t, shelfIds));
       let excess = visible.length - limit;
       if (excess <= 0) continue;
       const candidates = visible
@@ -626,16 +668,16 @@ export class Engine {
    * Skipped when the state was already captured after you last used the tab.
    */
   async captureInto(tab, rec, timeout = CAPTURE_TIMEOUT) {
-    if (!tab || tab.discarded || !isWebUrl(tab.url)) return false;
+    if (!tab || unloaded(tab) || !isWebUrl(tab.url)) return false;
     const wantText = this.settings.captureText && rec.excerptUrl !== tab.url;
     if (!wantText && rec.freeze && rec.freeze.at >= rec.lastActiveAt) return true;
     const res = await this.p.tabs.sendMessage(tab.id, { type: 'ebb:capture', text: wantText }, timeout);
     if (!res || typeof res !== 'object') return false;
-    this.applyCaptureResult(rec, res, tab.url, wantText);
+    await this.applyCaptureResult(rec, res, tab.url, wantText);
     return true;
   }
 
-  applyCaptureResult(rec, res, url, withText) {
+  async applyCaptureResult(rec, res, url, withText) {
     rec.freeze = {
       scrollY: finite(res.scrollY),
       scrollRatio: Math.min(1, Math.max(0, finite(res.scrollRatio))),
@@ -647,8 +689,13 @@ export class Engine {
     if (typeof res.title === 'string' && res.title) rec.title = res.title.slice(0, 300);
     if (typeof res.dirty === 'boolean') rec.dirty = res.dirty;
     if (withText && this.settings.captureText && typeof res.excerpt === 'string') {
-      rec.excerpt = res.excerpt.slice(0, 700);
-      rec.description = typeof res.description === 'string' ? res.description.slice(0, 300) : '';
+      await this.p.repo.put('snapshots', {
+        id: normalizeUrl(url),
+        url,
+        excerpt: res.excerpt.slice(0, 700),
+        description: typeof res.description === 'string' ? res.description.slice(0, 300) : '',
+        at: this.now(),
+      });
       rec.excerptUrl = url;
     }
     this.touch();
@@ -673,7 +720,7 @@ export class Engine {
   async applyCapture(tabId, res, req) {
     const rec = this.state.tabs[tabId];
     if (!rec || normalizeUrl(rec.url) !== normalizeUrl(req.url)) return;
-    this.applyCaptureResult(rec, res, req.url, req.text);
+    await this.applyCaptureResult(rec, res, req.url, req.text);
   }
 
   // ---------------------------------------------------------------- actions on tabs
@@ -698,7 +745,7 @@ export class Engine {
 
   /** Move a tab into the window's collapsed Shelf group, one click away. */
   async shelve(tab, rec, reason) {
-    if (!tab.discarded && !tab.active) {
+    if (!unloaded(tab) && !tab.active) {
       const rested = await this.rest(tab, rec);
       if (rested) tab = rested;
       else if (rec.dirty) return false;
@@ -710,6 +757,7 @@ export class Engine {
     rec.shelvedClock = this.activeMs;
     this.touch();
     await this.log({ type: 'shelve', host: hostOf(rec.url), reason });
+    if (reason === 'idle' || reason === 'budget') this.noteIntro('shelf');
     return true;
   }
 
@@ -737,11 +785,13 @@ export class Engine {
     return groupId;
   }
 
-  libraryItem(rec, { reason, batchId = null }) {
+  async libraryItem(rec, { reason, batchId = null }) {
     const hunt = rec.huntId ? this.state.hunts[rec.huntId] : null;
+    const snapshot = this.settings.captureText && isWebUrl(rec.url) ? await this.p.repo.get('snapshots', normalizeUrl(rec.url)) : null;
     return {
       id: this.p.id('lib'),
       url: rec.url,
+      key: normalizeUrl(rec.url),
       title: rec.title || prettyUrl(rec.url),
       favIconUrl: rec.favIconUrl || '',
       kind: rec.kind,
@@ -751,19 +801,42 @@ export class Engine {
       batchId,
       archivedAt: this.now(),
       freeze: rec.freeze || null,
-      excerpt: rec.excerpt || '',
-      description: rec.description || '',
+      excerpt: snapshot?.excerpt || rec.excerpt || '',
+      description: snapshot?.description || rec.description || '',
       visits: rec.visits || 0,
       fromStage: rec.stage,
     };
   }
 
+  /** Save to the Library, keeping one entry per page: an older entry for the same page is folded in. */
+  async addToLibrary(item) {
+    if (item.reason !== 'receipt' && item.key) {
+      for (const old of await this.p.repo.findBy('library', 'key', item.key)) {
+        if (old.reason === 'receipt' || old.id === item.id) continue;
+        item.excerpt ||= old.excerpt || '';
+        item.description ||= old.description || '';
+        item.freeze ||= old.freeze || null;
+        item.visits = Math.max(item.visits || 0, old.visits || 0);
+        await this.p.repo.delete('library', old.id);
+      }
+    }
+    await this.p.repo.put('library', item);
+    return item;
+  }
+
+  async findLibraryItemByUrl(url) {
+    const key = normalizeUrl(url);
+    const [byKey] = (await this.p.repo.findBy('library', 'key', key)).filter((i) => i.reason !== 'receipt');
+    if (byKey) return byKey;
+    return (await this.p.repo.getAll('library')).find((i) => i.reason !== 'receipt' && normalizeUrl(i.url) === key) || null;
+  }
+
   /** Close a tab into the Library, keeping where you were and a text excerpt. */
   async archiveTab(tab, rec, { reason, batchId = null, type = 'archive', capture = true } = {}) {
     if (capture && tab && tab.status === 'complete') await this.captureInto(tab, rec, 400);
-    const item = this.libraryItem(rec, { reason, batchId });
-    await this.p.repo.put('library', item);
+    const item = await this.addToLibrary(await this.libraryItem(rec, { reason, batchId }));
     if (tab) {
+      await this.leaveShelfIfLast(tab);
       this.expectedRemovals.add(tab.id);
       await this.p.tabs.remove(tab.id);
     }
@@ -772,7 +845,73 @@ export class Engine {
     delete this.state.pendingDiscard[rec.tabId];
     this.touch();
     await this.log({ type, from: rec.stage, host: hostOf(rec.url), reason });
+    if (reason === 'idle') this.noteIntro('library');
     return item;
+  }
+
+  // ---------------------------------------------------------------- first-time explanations
+
+  /** The first time Ebb moves tabs on its own, explain it once you are back. */
+  noteIntro(kind) {
+    if (this.state.intro[kind]) return;
+    const pending = this.state.introPending;
+    if (pending?.kind === kind) pending.count += 1;
+    else if (!pending) this.state.introPending = { kind, count: 1 };
+    this.touch();
+  }
+
+  introToast({ kind, count }) {
+    if (kind === 'shelf') {
+      return {
+        text: `While you were away, Ebb moved ${plural(count, 'idle tab')} to the Shelf at the end of your tab bar. Click one there to bring it back.`,
+        actions: [
+          { id: 'show-shelf', label: 'Show me' },
+          { id: 'dismiss', label: 'Got it' },
+        ],
+        timeoutMs: 20000,
+      };
+    }
+    const where = this.settings.useShelf ? 'that sat unused on the Shelf' : 'you hadn’t used in a long time';
+    return {
+      text: `Ebb closed ${plural(count, 'tab')} ${where}. They’re in its Library with your place on each page: type “ebb” and a space in the address bar to find one.`,
+      actions: [{ id: 'dismiss', label: 'Got it' }],
+      timeoutMs: 20000,
+    };
+  }
+
+  /** Called when you are back (active, Chrome focused): show a waiting explanation on your current page. */
+  maybeIntroduce() {
+    const pending = this.state.introPending;
+    if (!pending || this.introducing || this.atBoundary()) return;
+    this.introducing = true;
+    const toast = this.introToast(pending);
+    this.spawn(async () => {
+      try {
+        const win = await this.p.windows.getLastFocused();
+        const [tab] = win ? await this.p.tabs.query({ active: true, windowId: win.id }) : [];
+        if (!tab || unloaded(tab) || !isWebUrl(tab.url)) return; // try again on the next page you visit
+        const res = await this.p.tabs.sendMessage(tab.id, { type: 'ebb:toast', toast }, 1000);
+        if (res?.ok) await this.dispatch('introShown', pending.kind);
+      } finally {
+        this.introducing = false;
+      }
+    });
+  }
+
+  introShown(kind) {
+    this.state.intro[kind] = true;
+    if (this.state.introPending?.kind === kind) this.state.introPending = null;
+    this.touch();
+  }
+
+  /**
+   * Chrome keeps a tab group whose last tab is closed as a saved group (synced, when signed in).
+   * Ungrouping the last Shelf tab before closing it deletes the group instead.
+   */
+  async leaveShelfIfLast(tab) {
+    if (!this.shelfGroupIds().has(tab.groupId)) return;
+    const left = await this.p.tabs.query({ groupId: tab.groupId });
+    if (left.length <= 1) await this.p.tabs.ungroup([tab.id]);
   }
 
   /** Put your place on the page back when this tab next finishes loading the same page. */
@@ -826,6 +965,9 @@ export class Engine {
     const index = await this.restoreIndex(tab, rec.huntId);
     if (index != null) await this.p.tabs.move(tabId, { index });
     if (activate) await this.p.tabs.update(tabId, { active: true });
+    // Chrome expands a group when one of its tabs is selected; fold the rest of the Shelf away again.
+    const shelfId = this.state.shelf[tab.windowId];
+    if (shelfId != null) await this.p.groups.update(shelfId, { collapsed: true });
     rec.visits += 1;
     this.queueRestore(tabId, rec.freeze, rec.url);
     this.markActive(rec);
@@ -834,12 +976,37 @@ export class Engine {
     return true;
   }
 
-  /** Bring a Library item back. Recently closed tabs come back with their history. */
-  async restoreItem(id, { active = true, background = false, from = 'library', windowId } = {}) {
+  /**
+   * Bring a Library item back. Recently closed tabs come back with their history.
+   * options.active      open it in front (default) or behind the current tab
+   * options.unloaded    open it unloaded (undo of a batch: nothing reloads all at once)
+   * options.intoTabId   load it in this tab instead of a new one (the address bar's "current tab")
+   */
+  async restoreItem(id, { active = true, unloaded: restUnloaded = false, from = 'library', windowId, intoTabId } = {}) {
     const item = await this.p.repo.get('library', id);
     if (!item || !isWebUrl(item.url)) return null;
-    let tab = background ? null : await this.sessionRestore(item);
-    if (!tab) tab = await this.createTab(await this.placeNewTab({ url: item.url, active: active && !background }, windowId));
+    if (!restUnloaded) {
+      const open = await this.findOpenTab(item.url);
+      if (open) {
+        // Already open again: go there rather than opening it twice.
+        if (active) {
+          await this.p.tabs.update(open.id, { active: true });
+          await this.p.windows.update(open.windowId, { focused: true });
+        }
+        await this.p.repo.delete('library', id);
+        await this.log({ type: 'restore', from, host: hostOf(item.url) });
+        this.touch();
+        return open;
+      }
+    }
+    let tab = null;
+    if (intoTabId != null) {
+      tab = await this.p.tabs.update(intoTabId, { url: item.url, active: true });
+    } else if (active && !restUnloaded) {
+      tab = await this.sessionRestore(item);
+      if (tab) tab = await this.settleRestoredTab(tab, windowId);
+    }
+    if (!tab) tab = await this.createTab(await this.placeNewTab({ url: item.url, active: active && !restUnloaded }, windowId));
     if (!tab) return null;
     const rec = this.ensureRecord(tab);
     if (item.huntId && !this.state.hunts[item.huntId]) {
@@ -857,20 +1024,21 @@ export class Engine {
         doneAt: 0,
       };
     }
+    if (item.excerpt && this.settings.captureText) {
+      await this.p.repo.put('snapshots', { id: normalizeUrl(item.url), url: item.url, excerpt: item.excerpt, description: item.description || '', at: this.now() });
+    }
     Object.assign(rec, {
       huntId: item.huntId || rec.huntId,
       title: rec.title || item.title,
       freeze: item.freeze,
-      excerpt: item.excerpt || '',
       excerptUrl: item.excerpt ? item.url : '',
-      description: item.description || '',
-      visits: Math.max(item.visits || 0, 1) + (background ? 0 : 1),
+      visits: Math.max(item.visits || 0, 1) + (restUnloaded ? 0 : 1),
       fresh: false,
       restored: true,
       keepHuntOnce: true,
     });
     this.markActive(rec);
-    if (background) {
+    if (restUnloaded) {
       rec.stage = 'resting';
       this.state.pendingDiscard[tab.id] = true;
     }
@@ -880,6 +1048,30 @@ export class Engine {
     await this.refreshHostMult();
     this.touch();
     return tab;
+  }
+
+  /** An open tab showing this page, if there is one. */
+  async findOpenTab(url) {
+    const key = normalizeUrl(url);
+    const tabs = await this.p.tabs.query({ windowType: 'normal' });
+    return tabs.find((t) => normalizeUrl(t.url || t.pendingUrl || '') === key) || null;
+  }
+
+  /**
+   * Session restore puts a tab back in its old window and group, which may be the Shelf or a
+   * window you are not looking at. Bring it out of the Shelf and to the window you asked from.
+   */
+  async settleRestoredTab(tab, windowId) {
+    const shelfIds = this.shelfGroupIds();
+    const inShelf = shelfIds.has(tab.groupId);
+    if (inShelf) await this.p.tabs.ungroup([tab.id]);
+    const target = windowId ?? tab.windowId;
+    if (inShelf || target !== tab.windowId) {
+      const place = await this.placeNewTab({}, target);
+      await this.p.tabs.move(tab.id, { windowId: target, index: place.index ?? -1 });
+      await this.p.tabs.update(tab.id, { active: true });
+    }
+    return (await this.p.tabs.get(tab.id)) || tab;
   }
 
   async sessionRestore(item) {
@@ -956,6 +1148,7 @@ export class Engine {
     }
     if (rec.visits === 0 || this.activeMs - rec.lastActiveClock >= REVISIT_GAP) rec.visits += 1;
     this.markActive(rec);
+    this.maybeIntroduce();
   }
 
   /** Entry point for tabs.onUpdated: bookkeeping in the queue, page work outside it. */
@@ -965,6 +1158,7 @@ export class Engine {
   }
 
   async onTabUpdated(tabId, change, tab) {
+    if (this.expectedRemovals.has(tabId)) return {}; // Ebb is closing it
     let rec = this.ensureRecord(tab);
     if (change.url) {
       const adopted = this.lateAdopt(tab, rec);
@@ -973,7 +1167,6 @@ export class Engine {
         delete rec.adopted;
         await this.settleAdopted(tab, rec);
       }
-      rec.dirty = false;
     }
     if (change.title) rec.title = change.title;
     if (change.favIconUrl) rec.favIconUrl = change.favIconUrl;
@@ -1092,6 +1285,11 @@ export class Engine {
     const rec = this.state.tabs[tabId];
     delete this.state.tabs[tabId];
     if (windowId != null && this.state.activeByWindow[windowId] === tabId) delete this.state.activeByWindow[windowId];
+    if (rec && !isWindowClosing && rec.stage === 'shelved' && isWebUrl(rec.url)) {
+      // Closed from the Shelf (perhaps the whole group at once): keep it in the Library.
+      await this.addToLibrary(await this.libraryItem(rec, { reason: 'shelf-closed' }));
+      await this.log({ type: 'archive', from: 'shelved', host: hostOf(rec.url), reason: 'shelf-closed' });
+    }
     if (rec && isWindowClosing && isWebUrl(rec.url)) {
       // The window may be reopened, or the browser is shutting down: keep the record a while.
       (this.state.limbo[normalizeUrl(rec.url)] ||= []).push({ rec, at: this.now() });
@@ -1107,7 +1305,7 @@ export class Engine {
         if (now - entry.at < LIMBO_MS) {
           waiting.push(entry);
         } else if (entry.rec.stage === 'shelved' || entry.rec.stage === 'resting') {
-          await this.p.repo.put('library', this.libraryItem(entry.rec, { reason: 'window-closed' }));
+          await this.addToLibrary(await this.libraryItem(entry.rec, { reason: 'window-closed' }));
           await this.log({ type: 'archive', from: entry.rec.stage, host: hostOf(entry.rec.url), reason: 'window-closed' });
         }
       }
@@ -1136,7 +1334,7 @@ export class Engine {
   }
 
   /** A main-frame navigation committed: decide which hunt the tab belongs to. */
-  async onNavCommitted({ tabId, frameId, url, transitionType }) {
+  async onNavCommitted({ tabId, frameId, url, transitionType, sameDocument = false }) {
     if (frameId !== 0 || !isWebUrl(url)) return;
     const tab = await this.p.tabs.get(tabId);
     if (!tab) return;
@@ -1154,7 +1352,9 @@ export class Engine {
     delete rec.keepHuntOnce;
     rec.url = url;
     rec.kind = classify(url);
-    rec.dirty = false;
+    // A new document starts without unsaved typing; a same-document change (pushState, #hash)
+    // keeps whatever the page reported, since the page will not report it again.
+    if (!sameDocument) rec.dirty = false;
     if (restoring) {
       rec.fresh = false;
       this.touch();
@@ -1219,13 +1419,30 @@ export class Engine {
     return item;
   }
 
-  async openLater(id, { active = true, windowId, opener } = {}) {
+  async openLater(id, { active = true, windowId, opener, intoTabId } = {}) {
     const item = await this.p.repo.get('later', id);
     if (!item) return null;
-    const props = opener
-      ? { url: item.url, active, windowId: opener.windowId, index: opener.index + 1, openerTabId: opener.id }
-      : await this.placeNewTab({ url: item.url, active }, windowId);
-    const tab = await this.createTab(props);
+    const open = await this.findOpenTab(item.url);
+    if (open) {
+      if (active) {
+        await this.p.tabs.update(open.id, { active: true });
+        await this.p.windows.update(open.windowId, { focused: true });
+      }
+      await this.p.repo.delete('later', id);
+      this.state.counts.later = Math.max(0, (this.state.counts.later || 0) - 1);
+      await this.log({ type: 'open-later', host: hostOf(item.url) });
+      this.touch();
+      return open;
+    }
+    let tab;
+    if (intoTabId != null) {
+      tab = await this.p.tabs.update(intoTabId, { url: item.url, active: true });
+    } else {
+      const props = opener
+        ? { url: item.url, active, windowId: opener.windowId, index: opener.index + 1, openerTabId: opener.id }
+        : await this.placeNewTab({ url: item.url, active }, windowId);
+      tab = await this.createTab(props);
+    }
     if (!tab) return null;
     const rec = this.ensureRecord(tab);
     if (item.source?.huntId && this.state.hunts[item.source.huntId]) {
@@ -1251,9 +1468,10 @@ export class Engine {
     const items = await this.p.repo.getAll('later');
     for (const item of items) {
       if (!isExpired(item, now, this.settings.laterExpireDays)) continue;
-      await this.p.repo.put('library', {
+      await this.addToLibrary({
         id: this.p.id('lib'),
         url: item.url,
+        key: normalizeUrl(item.url),
         title: item.title,
         favIconUrl: '',
         kind: classify(item.url),
@@ -1314,10 +1532,9 @@ export class Engine {
     if (exceptTabId != null) {
       const receiptTab = await this.p.tabs.get(exceptTabId);
       if (receiptTab && isWebUrl(receiptTab.url)) {
-        await this.p.repo.put('library', {
-          ...this.libraryItem(this.ensureRecord(receiptTab), { reason: 'receipt', batchId }),
-          kind: 'receipt',
-        });
+        const rec = this.ensureRecord(receiptTab);
+        await this.captureInto(receiptTab, rec, 700); // keeps the order number with the receipt
+        await this.addToLibrary({ ...(await this.libraryItem(rec, { reason: 'receipt', batchId })), kind: 'receipt' });
       }
     }
     hunt.doneAt = this.now();
@@ -1371,7 +1588,7 @@ export class Engine {
       .sort((a, b) => a.archivedAt - b.archivedAt);
     let count = 0;
     for (const item of items) {
-      if (await this.restoreItem(item.id, { background: true, from: 'undo' })) count += 1;
+      if (await this.restoreItem(item.id, { unloaded: true, from: 'undo' })) count += 1;
     }
     for (const item of await this.p.repo.getAll('library')) {
       if (item.batchId === batchId && item.reason === 'receipt') await this.p.repo.delete('library', item.id);
@@ -1405,7 +1622,7 @@ export class Engine {
       .sort((a, b) => b.archivedAt - a.archivedAt);
     let count = 0;
     for (const [i, item] of items.entries()) {
-      if (await this.restoreItem(item.id, { active: i === 0, background: i > 0, from: 'resume' })) count += 1;
+      if (await this.restoreItem(item.id, { active: i === 0, unloaded: i > 0, from: 'resume' })) count += 1;
     }
     this.dismissResume();
     return { count };
@@ -1482,6 +1699,16 @@ export class Engine {
     this.state.hostMultAt = 0;
     await this.refreshHostMult();
     await this.p.repo.deleteBefore('ledger', 'at', now - LEDGER_RETENTION_MS);
+    const inUse = new Set(
+      [
+        ...Object.values(this.state.tabs),
+        ...Object.values(this.state.limbo).flat().map((entry) => entry.rec),
+        ...Object.values(this.state.startup?.prev || {}).flat(),
+      ].map((rec) => normalizeUrl(rec.url)),
+    );
+    for (const snap of await this.p.repo.getAll('snapshots')) {
+      if (!inUse.has(snap.id) && now - snap.at > DAY) await this.p.repo.delete('snapshots', snap.id);
+    }
     const live = new Set(Object.values(this.state.tabs).map((r) => r.huntId));
     for (const [id, hunt] of Object.entries(this.state.hunts)) {
       if (!live.has(id) && now - hunt.lastActiveAt > 30 * DAY) delete this.state.hunts[id];
@@ -1513,7 +1740,12 @@ export class Engine {
       case 'panel:settings': {
         const next = withDefaults({ ...this.settings, ...(msg.patch && typeof msg.patch === 'object' ? msg.patch : {}) });
         if (JSON.stringify(next) !== JSON.stringify(this.settings)) {
+          const stopText = this.settings.captureText && !next.captureText;
           this.settings = next;
+          if (stopText) {
+            await this.p.repo.clear('snapshots');
+            for (const rec of Object.values(this.state.tabs)) rec.excerptUrl = '';
+          }
           this.touch();
         }
         return this.settings;
@@ -1528,9 +1760,12 @@ export class Engine {
   }
 
   async onToastAction({ action, data = {} }, tab) {
+    const own = tab ? this.state.tabs[tab.id] : null;
     switch (action) {
       case 'tuck': {
-        const { count, batchId } = await this.tuckHunt(data.huntId, tab?.id ?? null);
+        // Only the task of the page that showed the offer.
+        if (!own?.huntId || own.huntId !== data.huntId) return { toast: { text: 'Nothing to tuck away.', timeoutMs: 3000 } };
+        const { count, batchId } = await this.tuckHunt(data.huntId, tab.id);
         if (!count) return { toast: { text: 'Nothing to tuck away.', timeoutMs: 3000 } };
         return {
           toast: {
@@ -1541,8 +1776,15 @@ export class Engine {
         };
       }
       case 'undo': {
+        const items = data.batchId ? await this.p.repo.findBy('library', 'batchId', data.batchId) : [];
+        if (!own?.huntId || !items.some((i) => i.huntId === own.huntId)) return { toast: { text: 'Nothing to bring back.', timeoutMs: 3000 } };
         const { count } = await this.undoBatch(data.batchId);
         return { toast: { text: `Brought back ${plural(count, 'tab')}.`, timeoutMs: 3000 } };
+      }
+      case 'show-shelf': {
+        const shelfId = tab && this.state.shelf[tab.windowId];
+        if (shelfId != null) await this.p.groups.update(shelfId, { collapsed: false });
+        return { ok: true };
       }
       case 'open-later': {
         const item = await this.p.repo.get('later', data.laterId);
@@ -1574,14 +1816,15 @@ export class Engine {
       case 'archive-tab': {
         const tab = await this.p.tabs.get(msg.tabId);
         if (!tab || tab.pinned || !isWebUrl(tab.url)) return { ok: false };
-        await this.archiveTab(tab, this.ensureRecord(tab), { reason: 'manual' });
-        return { ok: true };
+        const item = await this.archiveTab(tab, this.ensureRecord(tab), { reason: 'manual' });
+        return { ok: true, id: item.id };
       }
       case 'keep-tab':
         return this.keepTab(msg.tabId, msg.mode ?? null);
       case 'later-tab': {
         const tab = await this.p.tabs.get(msg.tabId);
-        return { ok: Boolean(await this.sendTabToLater(tab)) };
+        const item = await this.sendTabToLater(tab);
+        return item ? { ok: true, id: item.id } : { ok: false };
       }
       case 'shelve-hunt':
         return { count: await this.shelveWhere((rec) => rec.huntId === msg.huntId) };
@@ -1627,6 +1870,60 @@ export class Engine {
     }
   }
 
+  // ---------------------------------------------------------------- address bar: "ebb <words>"
+
+  /** Suggestions while you type: Later links first, then Library pages, best matches first. */
+  async omniboxSuggest(text) {
+    const q = String(text || '').trim();
+    if (!q) return [];
+    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+    const later = (await this.p.repo.getAll('later'))
+      .filter((i) => terms.every((t) => `${i.title} ${i.url}`.toLowerCase().includes(t)))
+      .sort((a, b) => b.savedAt - a.savedAt)
+      .slice(0, 2)
+      .map((i) => ({ url: i.url, title: i.title, where: 'Later' }));
+    const library = (await this.library({ q, limit: 8 })).items.map((i) => ({
+      url: i.url,
+      title: i.title,
+      where: i.huntName && i.huntName !== 'Later' ? `Library · ${i.huntName}` : 'Library',
+    }));
+    const seen = new Set();
+    const suggestions = [];
+    for (const s of [...later, ...library]) {
+      if (seen.has(s.url) || suggestions.length >= 6) continue;
+      seen.add(s.url);
+      suggestions.push({ content: s.url, description: `${xml(s.title)} <dim>· ${xml(s.where)}</dim> <url>${xml(prettyUrl(s.url))}</url>` });
+    }
+    return suggestions;
+  }
+
+  /**
+   * Enter: open the chosen suggestion, or the best match for what you typed.
+   * disposition is Chrome's: currentTab, newForegroundTab or newBackgroundTab.
+   */
+  async omniboxEnter(text, disposition = 'currentTab', current = null) {
+    const q = String(text || '').trim();
+    if (!q) return { ok: false };
+    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+    const laterItems = await this.p.repo.getAll('later');
+    let later = null;
+    let item = null;
+    if (isWebUrl(q)) {
+      later = laterItems.find((i) => i.url === q) || null;
+      if (!later) item = await this.findLibraryItemByUrl(q);
+    } else {
+      [item = null] = (await this.library({ q, limit: 1 })).items;
+      if (!item) later = laterItems.find((i) => terms.every((t) => `${i.title} ${i.url}`.toLowerCase().includes(t))) || null;
+    }
+    const active = disposition !== 'newBackgroundTab';
+    const intoTabId = disposition === 'currentTab' && current && !current.pinned ? current.id : undefined;
+    const windowId = current?.windowId;
+    if (later) return { ok: Boolean(await this.openLater(later.id, { active, intoTabId, windowId })) };
+    if (item) return { ok: Boolean(await this.restoreItem(item.id, { active, intoTabId, windowId, from: 'search' })) };
+    if (current) this.toast(current.id, { text: `Nothing in Ebb matches “${q}”.`, timeoutMs: 3000 });
+    return { ok: false };
+  }
+
   // ---------------------------------------------------------------- views
 
   async viewModel({ windowId } = {}) {
@@ -1644,8 +1941,8 @@ export class Engine {
       const age = Math.max(0, this.activeMs - rec.lastActiveClock);
       let stage = rec.stage;
       if (shelfIds.has(tab.groupId)) stage = 'shelved';
-      else if (stage === 'shelved') stage = tab.discarded ? 'resting' : 'live';
-      else if (tab.discarded) stage = 'resting';
+      else if (stage === 'shelved') stage = unloaded(tab) ? 'resting' : 'live';
+      else if (unloaded(tab)) stage = 'resting';
       totals[stage] = (totals[stage] || 0) + 1;
       const url = tab.url || rec.url;
       const view = {
@@ -1759,8 +2056,21 @@ export class Engine {
     const counts = {};
     for (const store of ['library', 'later', 'ledger']) {
       const items = Array.isArray(data[store]) ? data[store].filter((i) => i && typeof i === 'object' && valid[store](i)) : [];
-      for (const item of items) await this.p.repo.put(store, item);
-      counts[store] = items.length;
+      let added = 0;
+      for (const item of items) {
+        if (store === 'library') {
+          item.key ||= normalizeUrl(item.url);
+          // Keep whichever copy of a page was closed last.
+          const existing = await this.p.repo.findBy('library', 'key', item.key);
+          const newer = existing.some((e) => e.reason !== 'receipt' && e.id !== item.id && e.archivedAt >= item.archivedAt);
+          if (item.reason !== 'receipt' && newer) continue;
+          await this.addToLibrary(item);
+        } else {
+          await this.p.repo.put(store, item);
+        }
+        added += 1;
+      }
+      counts[store] = added;
     }
     if (data.hunts && typeof data.hunts === 'object') {
       for (const [id, hunt] of Object.entries(data.hunts)) {
