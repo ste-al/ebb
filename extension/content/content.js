@@ -82,6 +82,11 @@
   on(document, 'visibilitychange', () => {
     if (document.visibilityState === 'hidden') recompute();
   });
+  // Back/forward cache: the page comes back as it was, typing included, but Ebb's record of it
+  // was reset by the navigation. Report the current state again.
+  on(window, 'pageshow', (e) => {
+    if (e.persisted && dirty) send({ type: 'ebb:dirty', dirty });
+  });
 
   // ---------------------------------------------------------------- the link you last clicked
 

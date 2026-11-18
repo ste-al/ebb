@@ -105,22 +105,35 @@ const shortDate = (ts) => new Date(ts).toLocaleDateString(undefined, { month: 's
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 let noticeTimer = null;
-function notice(text) {
+/** A short message at the bottom of the panel, optionally with one action such as Undo. */
+function notice(text, action = null) {
   const el = $('#notice');
-  el.textContent = text;
+  el.replaceChildren(h('span', { text }));
+  if (action) {
+    el.append(
+      h('button', { type: 'button', class: 'link notice-action', onClick: () => {
+        el.hidden = true;
+        action.run();
+      } }, action.label),
+    );
+  }
   el.hidden = false;
   clearTimeout(noticeTimer);
   noticeTimer = setTimeout(() => {
     el.hidden = true;
-  }, 4000);
+  }, action ? 7000 : 4000);
 }
 
-/** Run an action, report errors, then refresh. */
+/** Run an action, report errors, then refresh. `message` may be text, or a function of the result returning text or [text, action]. */
 async function run(promise, message) {
   try {
     const res = await promise;
     if (res && res.ok === false && res.error) notice(res.error);
-    else if (message) notice(typeof message === 'function' ? message(res) : message);
+    else if (message) {
+      const shown = typeof message === 'function' ? message(res) : message;
+      if (Array.isArray(shown)) notice(...shown);
+      else if (shown) notice(shown);
+    }
   } catch (err) {
     notice(String(err?.message || err));
   }
@@ -236,6 +249,7 @@ function resumeCard(resume) {
 const PROTECTED = {
   pinned: 'pinned',
   playing: 'playing sound',
+  'kept active': 'kept loaded by Chrome',
   kept: 'kept',
   'unsaved input': 'unsaved typing',
   app: 'web app, never tidied',
@@ -277,8 +291,20 @@ function tabRow(t) {
     h('div', { class: 'actions' },
       t.pinned ? null : iconButton('keep', kept ? 'Stop keeping this tab' : 'Keep this tab for a week', () => run(act('keep-tab', { tabId: t.tabId, mode: kept ? null : 'week' })), { 'aria-pressed': String(kept) }),
       t.active || t.pinned || t.stage === 'shelved' || !/^https?:/.test(t.url) ? null : iconButton('shelf', 'Move to the Shelf', () => run(act('shelve-tab', { tabId: t.tabId }))),
-      t.pinned || !/^https?:/.test(t.url) ? null : iconButton('later', 'Send to Later', () => run(act('later-tab', { tabId: t.tabId }))),
-      t.pinned || !/^https?:/.test(t.url) ? null : iconButton('library', 'Close into the Library', () => run(act('archive-tab', { tabId: t.tabId }))),
+      t.pinned || !/^https?:/.test(t.url)
+        ? null
+        : iconButton('later', 'Send to Later', () =>
+            run(act('later-tab', { tabId: t.tabId }), (r) =>
+              r?.id ? ['Sent to Later.', { label: 'Undo', run: () => run(act('open-later', { id: r.id })) }] : null,
+            ),
+          ),
+      t.pinned || !/^https?:/.test(t.url)
+        ? null
+        : iconButton('library', 'Close into the Library', () =>
+            run(act('archive-tab', { tabId: t.tabId }), (r) =>
+              r?.id ? ['Closed into the Library.', { label: 'Undo', run: () => run(act('restore-item', { id: r.id })) }] : null,
+            ),
+          ),
     ),
   );
 }
@@ -389,6 +415,7 @@ const REASONS = {
   'window-closed': 'its window was closed',
   'fresh-start': 'fresh start',
   'later-expired': 'unread in Later',
+  'shelf-closed': 'closed from the Shelf',
   manual: 'you closed it here',
 };
 
@@ -614,14 +641,28 @@ function show(next) {
   } catch {
     // Storage unavailable: the panel just opens on Now next time.
   }
-  for (const tab of document.querySelectorAll('.tabs [role="tab"]')) tab.setAttribute('aria-selected', String(tab.dataset.view === view));
+  for (const tab of document.querySelectorAll('.tabs [role="tab"]')) {
+    const selected = tab.dataset.view === view;
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
   for (const section of document.querySelectorAll('main > section')) section.hidden = section.dataset.view !== view;
   if (state) render();
   if (view === 'library') loadLibrary();
 }
 
 function bind() {
-  for (const tab of document.querySelectorAll('.tabs [role="tab"]')) tab.addEventListener('click', () => show(tab.dataset.view));
+  const tabs = [...document.querySelectorAll('.tabs [role="tab"]')];
+  for (const tab of tabs) tab.addEventListener('click', () => show(tab.dataset.view));
+  $('.tabs').addEventListener('keydown', (e) => {
+    const i = tabs.findIndex((t) => t.dataset.view === view);
+    const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+    if (next == null) return;
+    e.preventDefault();
+    const tab = tabs[(next + tabs.length) % tabs.length];
+    show(tab.dataset.view);
+    tab.focus();
+  });
   $('#pause').addEventListener('click', () => setSetting({ paused: !state?.settings?.paused }));
   let searchTimer = null;
   $('#library-q').addEventListener('input', (e) => {

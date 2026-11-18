@@ -9,7 +9,9 @@ globalThis.ebb = { engine }; // handy in the service worker console; the smoke t
 
 const run = wireEvents(engine, chrome, { onError: (where, err) => console.warn(`Ebb: ${where} failed`, err) });
 
-chrome.idle.setDetectionInterval(60);
+// Three minutes without input counts as stepping away. Reading a page for a minute or two
+// without touching anything is still using Chrome: the clock keeps running and nothing moves.
+chrome.idle.setDetectionInterval(180);
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 ensureAlarm();
 
@@ -69,6 +71,17 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   if (!tab) return;
   if (command === 'keep-tab') run('keepFromPage', tab.id, 'toggle');
   else if (command === 'send-to-later') run('sendTabToLater', tab);
+});
+
+// ---------------------------------------------------------------- address bar: "ebb <words>"
+
+chrome.omnibox.setDefaultSuggestion({ description: 'Search Ebb’s Library and Later list for <match>%s</match>' });
+chrome.omnibox.onInputChanged.addListener((text, suggest) => {
+  engine.dispatch('omniboxSuggest', text).then(suggest, () => suggest([]));
+});
+chrome.omnibox.onInputEntered.addListener(async (text, disposition) => {
+  const [current] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  run('omniboxEnter', text, disposition, current || null);
 });
 
 // ---------------------------------------------------------------- messages

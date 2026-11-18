@@ -3,7 +3,7 @@
 
 import { Engine } from '../../extension/lib/engine.js';
 import { wireEvents } from '../../extension/lib/wiring.js';
-import { MIN } from '../../extension/lib/util.js';
+import { MIN, HOUR } from '../../extension/lib/util.js';
 import { FakeBrowser } from './fake-browser.js';
 
 export { FakeBrowser };
@@ -152,4 +152,22 @@ export async function connect(browser) {
   const t = new Harness(browser);
   await t.settle();
   return t;
+}
+
+/**
+ * The next browser session after `previous`: same storage and Library, new tab ids, and the
+ * given tabs already restored by Chrome before Ebb's service worker starts (so no events).
+ */
+export function nextSession(previous, { restore, after = 10 * HOUR, firstId = 500 } = {}) {
+  const b = new FakeBrowser({ storage: previous.storageData, repo: previous.repo, firstId, now: previous.time + after });
+  const windowId = b.openWindow();
+  for (const { url, active = false } of restore) {
+    const id = b.nextTabId++;
+    b.tabs.set(id, {
+      id, windowId, url, title: url, favIconUrl: '', active, pinned: false, audible: false, discarded: false,
+      autoDiscardable: true, groupId: -1, status: 'complete', incognito: false, page: b.pageFor(url),
+    });
+    b.windows.get(windowId).order.push(id);
+  }
+  return b;
 }

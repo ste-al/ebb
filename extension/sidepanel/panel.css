@@ -590,6 +590,34 @@ summary:focus-visible {
   margin-bottom: 8px;
 }
 
+.tip {
+  margin: -2px 4px 8px;
+}
+
+kbd {
+  font: inherit;
+  font-weight: 600;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.notice > span {
+  flex: 1;
+}
+
+.notice .notice-action {
+  color: inherit;
+  text-decoration: underline;
+}
+
 .lib-list {
   background: var(--surface);
   border: 1px solid var(--line);

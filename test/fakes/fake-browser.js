@@ -35,6 +35,7 @@ export function memoryRepo(stores = {}) {
     delete: async (name, key) => void store(name).delete(key),
     clear: async (name) => void store(name).clear(),
     count: async (name) => store(name).size,
+    findBy: async (name, index, value) => [...store(name).values()].filter((v) => v[index] === value).map(clone),
     getAllSince: async (name, index, since) => [...store(name).values()].filter((v) => v[index] >= since).map(clone),
     deleteBefore: async (name, index, before) => {
       for (const [key, value] of store(name)) if (value[index] < before) store(name).delete(key);
@@ -67,6 +68,7 @@ export class FakeBrowser {
     this.pendingEvents = 0;
     this.focusedWindow = null;
     this.noDiscard = new Set();
+    this.savedGroups = []; // titles of groups Chrome kept as saved groups when their last tab closed
     const ev = () => new FakeEvent(this);
     this.api = {
       tabs: { onCreated: ev(), onActivated: ev(), onUpdated: ev(), onRemoved: ev(), onReplaced: ev(), onAttached: ev() },
@@ -196,6 +198,7 @@ export class FakeBrowser {
       pinned,
       audible: false,
       discarded: false,
+      autoDiscardable: true,
       groupId: -1,
       status: 'loading',
       incognito: false,
@@ -235,7 +238,7 @@ export class FakeBrowser {
     while (at < win.order.length && this.tabs.get(win.order[at]).openerTabId === opener) at += 1;
     this.tabs.set(id, {
       id, windowId, url: '', pendingUrl: url, title: '', favIconUrl: '', active: false, pinned: false, audible: false,
-      discarded: false, groupId: -1, status: 'loading', incognito: false, openerTabId: opener, page: this.pageFor(url),
+      discarded: false, autoDiscardable: true, groupId: -1, status: 'loading', incognito: false, openerTabId: opener, page: this.pageFor(url),
     });
     win.order.splice(at, 0, id);
     this.api.tabs.onCreated.emit(this.view(id));
@@ -296,11 +299,16 @@ export class FakeBrowser {
     const win = this.windows.get(tab.windowId);
     const index = this.indexOf(tabId);
     if (isWeb(tab.url)) {
-      this.closed.unshift({ lastModified: Math.floor(this.time / 1000), tab: { sessionId: `s${++this.seq}`, url: tab.url, title: tab.title, windowId: tab.windowId, index } });
+      this.closed.unshift({
+        lastModified: Math.floor(this.time / 1000),
+        tab: { sessionId: `s${++this.seq}`, url: tab.url, title: tab.title, windowId: tab.windowId, index, groupId: tab.groupId },
+      });
       this.closed = this.closed.slice(0, 25);
     }
     win.order.splice(index, 1);
     this.tabs.delete(tabId);
+    const group = this.groups.get(tab.groupId);
+    if (group && ![...this.tabs.values()].some((t) => t.groupId === group.id)) this.savedGroups.push(group.title);
     this.dropEmptyGroup(tab.groupId);
     if (tab.active && !isWindowClosing && win.order.length) this.activate(win.order[Math.min(index, win.order.length - 1)]);
     this.api.tabs.onRemoved.emit(tabId, { windowId: tab.windowId, isWindowClosing });
@@ -349,9 +357,22 @@ export class FakeBrowser {
     return this.view(tabId);
   }
 
-  moveTab(tabId, index) {
+  moveTab(tabId, index, windowId = null) {
     const tab = this.tabs.get(tabId);
     if (!tab) return null;
+    if (windowId != null && windowId !== tab.windowId && this.windows.has(windowId)) {
+      const from = this.windows.get(tab.windowId).order;
+      from.splice(from.indexOf(tabId), 1);
+      const oldWindow = tab.windowId;
+      if (tab.groupId !== -1) this.setGroup(tab, -1); // a group never spans windows
+      if (tab.active) {
+        tab.active = false;
+        if (from.length) this.activate(from[Math.min(from.length - 1, 0)]);
+      }
+      tab.windowId = windowId;
+      this.windows.get(windowId).order.push(tabId);
+      this.api.tabs.onAttached.emit(tabId, { newWindowId: windowId, newPosition: 0, oldWindowId: oldWindow });
+    }
     const order = this.windows.get(tab.windowId).order;
     order.splice(order.indexOf(tabId), 1);
     const at = index < 0 || index > order.length ? order.length : index;
@@ -442,6 +463,10 @@ export class FakeBrowser {
     const [session] = this.closed.splice(i, 1);
     const windowId = this.windows.has(session.tab.windowId) ? session.tab.windowId : this.focusedWindow;
     const id = this.openTab(session.tab.url, { windowId, active: true, transition: 'reload', index: session.tab.index });
+    // Like Chrome, a restored tab rejoins its old group if that group is still open.
+    if (this.groups.has(session.tab.groupId) && this.tabs.get(id).groupId !== session.tab.groupId) {
+      this.groupTabs({ tabIds: [id], groupId: session.tab.groupId });
+    }
     return { lastModified: session.lastModified, tab: this.view(id) };
   }
 
@@ -471,7 +496,7 @@ export class FakeBrowser {
         get: run((id) => b.view(id)),
         create: run((props) => b.createTabApi(props)),
         update: run((id, props) => b.updateTabApi(id, props)),
-        move: run((id, props) => b.moveTab(id, props.index)),
+        move: run((id, props) => b.moveTab(id, props.index ?? -1, props.windowId ?? null)),
         remove: run((id) => b.closeTab(id)),
         discard: run((id) => b.discardTab(id)),
         group: run((options) => b.groupTabs(options)),

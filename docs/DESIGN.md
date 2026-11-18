@@ -23,10 +23,16 @@ chrome.* events ──► lib/wiring.js ──► Engine.dispatch(handler) ─�
 ```
 
 - **`lib/engine.js`** holds all behavior. It never touches `chrome.*` directly; it calls *ports*. `lib/chrome-ports.js` implements them on Chrome, and `test/fakes/fake-browser.js` implements them in memory for tests.
-- **Serialized handlers.** The MV3 service worker can be stopped at any moment, so each handler runs through `dispatch()`, a promise queue that loads state on demand, runs one handler at a time and saves afterwards (debounced by 400 ms).
+- **Serialized handlers.** The MV3 service worker can be stopped at any moment, so each handler runs through `dispatch()`, a promise queue that loads state on demand, runs one handler at a time and saves afterwards (at most once a second; the worker lives 30 seconds past its last event, so nothing is lost).
 - **Page round trips run outside the queue.** Asking a page for its scroll position or reading a confirmation page can be slow, so that work is `spawn()`ed outside the queue and its results are applied back through `dispatch()`. The queue stays responsive to tab events.
 - **The pure rules** live in small modules with no browser access: `lifetimes.js`, `hunts.js`, `search.js`, `classify.js`, `mission.js`, `later.js`, `ledger.js`, `settings.js`.
-- **Storage.** Live state (tab records, hunts, the clock) is one object in `chrome.storage.local`. The Library, Later items and ledger events live in IndexedDB (`library`, `later`, `ledger` stores), which is better suited to growing collections.
+- **Storage.** Live state (tab records, hunts, the clock) is one object in `chrome.storage.local`, saved often, so it is kept small. Everything that grows lives in IndexedDB:
+  - `library`: closed tabs. The normalized URL is the `key` index, so each page is kept once.
+  - `later`: queued links.
+  - `ledger`: action events.
+  - `snapshots`: text snippets of open pages, by normalized URL. They used to sit in each tab record and made up most of every save.
+
+  State version 2 moves version 1's snippets out on first load.
 - **The content script** is deliberately small and passive. It answers questions (`ebb:capture`, `ebb:signals`, `ebb:link-info`), applies a scroll/media restore, reports unsaved typing, and shows toasts in a closed shadow root. All decisions are made in the service worker.
 - **The side panel** renders a view model from `Engine.viewModel()` and sends every action back as a message. It sets page titles and URLs as text only, and only accepts imported URLs that are `http(s)`.
 
@@ -53,13 +59,15 @@ These are multiplied by the pace (gentle ×2, brisk ×0.5), the page kind (searc
 
 **The active clock** advances on each one-minute alarm, but only while a Chrome window has focus and `chrome.idle` reports *active*. Each step is capped at two minutes, so a laptop waking from sleep doesn't jump the clock. A tab's idle time starts when the user *leaves* it, and the tab in view in each window keeps resetting its own.
 
-**Boundaries.** Going idle or locked triggers a pass right away. Losing focus is noted and acted on by the next tick, because focus briefly drops to "no window" while switching between Chrome windows.
+**Boundaries.** Going idle (three minutes without input) or locking the screen triggers a pass right away. Losing focus is noted and acted on by the next tick, because focus briefly drops to "no window" while switching between Chrome windows. Three minutes rather than Chrome's minimum of one keeps reading a page from counting as being away; the reading time is active time.
 
 **Limits per pass.** At most 40 unloads and 25 moves, so a large backlog is tidied gradually. A tab that refuses to unload isn't retried for 30 active minutes.
 
 **Protection.** A tab is skipped if it is in view, pinned, audible, not an `http(s)` page, kept, has unsaved typing, is a known web app (mail, calendar, chat and so on), is on an exempt site, or Ebb is paused. Tabs in the user's own groups only ever rest. The content script reports unsaved typing when a text field the user typed in is non-empty (never reading its contents), and for 30 minutes after typing in a rich editor. It reports as the user types and again when they leave the tab, and any capture taken just before unloading carries its latest answer.
 
-**The soft budget.** When a window shows more visible tabs than the budget (15), the least recently used unprotected tabs are shelved at a boundary. Two guards keep this from feeling like a purge: it never runs in the first active hour after install, and never touches tabs used in the last 20 active minutes.
+**The soft budget.** When a window shows more loose tabs than the budget (15), the least recently used unprotected tabs are shelved at a boundary. Tabs in the user's own groups don't count, since Ebb never moves them. Two guards keep this from feeling like a purge: it never runs in the first active hour after install, and never touches tabs used in the last 20 active minutes.
+
+**Explaining itself.** The first time Ebb shelves tabs on its own, and the first time it closes tabs into the Library, it notes how many. When the user comes back (active again, or Chrome focused again, or a tab selected), it shows one toast on the current page. If that page can't show one, such as the new tab page, the note waits for the next page. Each explanation is shown once.
 
 ## Hunts
 
@@ -85,14 +93,24 @@ Tab ids change when the browser restarts. They don't when Ebb itself is reloaded
 - **Yes:** the extension was reloaded. Ebb reconciles its records with the open tabs.
 - **No:** the browser restarted. All old records are set aside, keyed by normalized address, and for two minutes restored tabs are *adopted* by address, keeping their hunt and history. Tabs that were resting or shelved are unloaded again rather than left loading. Records nobody adopted go to the Library as *didn't come back after a restart*. A resume card lists the hunts.
 
-This doesn't depend on `runtime.onStartup` arriving before the first tab events; a late `onStartup` is ignored. When a window closes, its tabs' records wait five minutes in *limbo* in case the window is reopened. After that, the ones Ebb had tidied (resting or shelved) go to the Library.
+This doesn't depend on `runtime.onStartup` arriving before the first tab events; a late `onStartup` is ignored. If a second restart comes before the first adoption window was closed out, the first one's leftovers are saved first. When a window closes, its tabs' records wait five minutes in *limbo* in case the window is reopened. After that, the ones Ebb had tidied (resting or shelved) go to the Library. A Shelf tab the user closes by hand (or the whole Shelf group) goes to the Library right away.
+
+**Chrome's saved tab groups.** Recent Chrome versions save every tab group, and sync them when signed in. A group whose last tab is *closed* stays behind as a saved group; a group whose last tab is *ungrouped* is deleted. So before closing the last Shelf tab, Ebb ungroups it. Closing a window that holds a Shelf is outside Ebb's control.
 
 ## Coming back
 
 - **Off the Shelf:** selecting a shelved tab ungroups it and moves it next to the other tabs of its hunt, or just before the Shelf.
-- **From the Library:** a tab closed in the last six hours that is still in Chrome's *Recently closed* list is restored with `sessions.restore`, so it comes back with its back/forward history. Otherwise a new tab opens just before the Shelf.
+- **From the Library:** if the page is open again, Ebb switches to that tab. Otherwise, a tab closed in the last six hours that is still in Chrome's *Recently closed* list is restored with `sessions.restore`, so it comes back with its back/forward history. Session restore puts a tab back in its old window and group, which may be the collapsed Shelf. Ebb then takes it out of the Shelf and moves it to the window the request came from. Failing that, a new tab opens just before the Shelf. Taking a tab off the Shelf folds the rest of the Shelf away again.
 - **Scroll position:** a pending restore is tied to the page's address and applied when that page finishes loading, and only if the page didn't restore its own position. Chrome starts reloading an unloaded tab the moment it is selected, so Ebb decides this from its own record rather than from `tab.discarded`.
 - **Undo of a batch:** the tabs reopen in the background and are unloaded as soon as each one has its address, so dozens of tabs never load at once.
+
+## Toasts and their buttons
+
+Toasts live in a closed shadow root, and their buttons only react to trusted clicks. The service worker also checks each action against the tab that sent it. *Tuck away* only works for that page's own task, and *Undo* only for a batch from that task. A compromised page can't act on another task's tabs.
+
+## The address bar
+
+The manifest registers the keyword `ebb`. While the user types, `omniboxSuggest()` returns up to six matches: Later links first, then Library pages matching every word of the query. Each suggestion's content is the page address, and titles are XML-escaped as Chrome's suggestion markup requires. On Enter, `omniboxEnter()` opens the chosen address, or the best match for free text, following Chrome's disposition: the current tab (navigated in place), a new tab, or a background tab.
 
 ## The ledger
 
@@ -102,12 +120,17 @@ Every action is an event: `rest`, `shelve`, `archive`, `tuck`, `later`, `restore
 
 - `test/unit`: the pure rules, plus the IndexedDB repo on `fake-indexeddb`.
 - `test/engine`: scenarios that run the real engine and the real event wiring against `FakeBrowser`. The fake mimics the Chrome behavior Ebb relies on: event order and snapshots, tab strip order, group contiguity, a click reloading an unloaded tab, recently closed sessions, and content-script replies.
-- `test/e2e`: loads the unpacked extension into Chrome for Testing and drives it against a local site. Hostnames like `shop.test` are mapped to the local server, so separate sites form separate hunts. It covers install, capture and unloading, the Shelf, Library restore with history, the Later lane (clicking the real toast button), mission accomplished with Undo, and the side panel.
+- `test/e2e`: loads the unpacked extension into Chrome for Testing and drives it against a local site. Hostnames like `shop.test` are mapped to the local server, so separate sites form separate hunts. It covers:
+  - install, capture and unloading, and the Shelf
+  - Library restore with history, including a page closed from the Shelf coming back outside it
+  - the Later lane and mission accomplished with Undo, clicking the real toast buttons
+  - the first-time explanation and its *Show me* button
+  - address-bar search and the side panel
 
 ## Ideas for later
 
 - A Firefox version (sidebar instead of side panel, and a different Shelf)
-- Search the Library from the address bar (an omnibox keyword)
 - Optional sync of the Library between devices, end-to-end encrypted
 - Per-hunt notes, and naming or merging hunts by hand for those who want to
 - Smarter page kinds learned from how the user treats each site
+- Shorter lifetimes for duplicate tabs (the same page open twice)

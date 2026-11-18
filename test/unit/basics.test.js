@@ -16,6 +16,9 @@ test('util: hosts, web URLs and normalization', () => {
     'https://example.com/p?id=7',
   );
   assert.equal(normalizeUrl('https://example.com/p?ref=keep'), 'https://example.com/p?ref=keep', 'ordinary parameters stay');
+  assert.equal(normalizeUrl('https://app.example/#/inbox'), 'https://app.example/#/inbox', 'app routes are different pages');
+  assert.equal(normalizeUrl('https://app.example/#!/item/4'), 'https://app.example/#!/item/4');
+  assert.equal(normalizeUrl('https://youtu.be/x?si=share123'), 'https://youtu.be/x');
   assert.equal(prettyUrl('https://www.example.com/docs/guide/'), 'example.com/docs/guide');
   assert.match(prettyUrl(`https://example.com/${'a'.repeat(80)}`), /…$/);
 });
@@ -41,6 +44,7 @@ test('search: recognizes results pages across engines and countries', () => {
     ['https://www.youtube.com/results?search_query=knot+tying', 'YouTube', 'knot tying'],
     ['https://www.amazon.de/s?k=standing+desk', 'Amazon', 'standing desk'],
     ['https://github.com/search?q=tab+manager&type=repositories', 'GitHub', 'tab manager'],
+    ['https://scholar.google.com/scholar?q=tidal+energy&hl=en', 'Google Scholar', 'tidal energy'],
   ];
   for (const [url, engine, query] of cases) assert.deepEqual(parseSearch(url), { engine, query }, url);
   assert.equal(parseSearch('https://www.google.com/maps/place/x'), null);

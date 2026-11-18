@@ -188,7 +188,21 @@ before(async () => {
     if (msg.type() === 'error' || msg.type() === 'warn') workerErrors.push(msg.text());
   });
   await waitFor(() => sw(() => Boolean(globalThis.ebb?.engine?.state)), { what: 'the engine to install' });
+  // The first-time explanations get their own test; keep them out of the others' way.
+  await setIntro({ shelf: true, library: true });
 });
+
+function setIntro(intro) {
+  return sw((value) => {
+    const e = globalThis.ebb.engine;
+    return e.enqueue(async () => {
+      await e.load();
+      e.state.intro = value;
+      e.state.introPending = null;
+      e.touch();
+    });
+  }, intro);
+}
 
 after(async () => {
   await browser?.close();
@@ -216,8 +230,10 @@ test('leaving a page captures your place; resting, the Shelf and coming back wor
   const rec = await waitFor(() => sw((id) => globalThis.ebb.engine.state.tabs[id]?.freeze?.scrollY > 1000 && globalThis.ebb.engine.state.tabs[id], t1.id), {
     what: 'the scroll position to be captured',
   });
-  assert.match(rec.excerpt, /The tide comes in/);
-  assert.equal(rec.description, 'Article 1: a page for testing Ebb.');
+  assert.ok(rec.excerptUrl, 'a text snippet was kept');
+  const snapshot = (await repo('snapshots')).find((x) => x.url === `${base}/article/1`);
+  assert.match(snapshot.excerpt, /The tide comes in/);
+  assert.equal(snapshot.description, 'Article 1: a page for testing Ebb.');
 
   await lifecycleAfter(31, { boundary: false });
   const rested = await tabById(t1.id);
@@ -248,7 +264,7 @@ test('a tab closed into the Library comes back with its history', async () => {
   await openPage(`${base}/links`);
   const [tab] = await tabsFor(`${base}/article/6`);
 
-  assert.deepEqual(await panel('archive-tab', { tabId: tab.id }), { ok: true });
+  assert.equal((await panel('archive-tab', { tabId: tab.id })).ok, true);
   await waitFor(async () => (await tabsFor(`${base}/article/6`)).length === 0, { what: 'the tab to close' });
   const [item] = (await repo('library')).filter((i) => i.url === `${base}/article/6`);
   assert.equal(item.title, 'Article 6');
@@ -343,6 +359,61 @@ test('the side panel renders the current state', async () => {
   await page.click('input[name="s-pace"][value="brisk"]');
   await waitFor(async () => (await settings({})).pace === 'brisk', { what: 'the setting to save' });
   assert.deepEqual(errors, []);
+});
+
+test('typing “ebb” in the address bar finds tidied pages', async () => {
+  const manifest = await sw(() => chrome.runtime.getManifest());
+  assert.equal(manifest.omnibox.keyword, 'ebb');
+  const url = `${site('notes')}/article/42`;
+  const suggestions = await sw((q) => globalThis.ebb.engine.dispatch('omniboxSuggest', q), '/article/42');
+  assert.equal(suggestions[0]?.content, url);
+  assert.match(suggestions[0].description, /^Article 42 <dim>· Library · notes\.test<\/dim> <url>notes\.test\/article\/42<\/url>$/);
+  const [current] = await sw(() => chrome.tabs.query({ active: true, lastFocusedWindow: true }));
+  await sw((u, tab) => globalThis.ebb.engine.dispatch('omniboxEnter', u, 'newForegroundTab', tab), url, current);
+  await waitFor(async () => (await tabsFor(url)).length === 1, { what: 'the page to open' });
+  assert.equal((await repo('library')).filter((i) => i.url === url).length, 0);
+});
+
+test('a page closed from the Shelf comes back outside the Shelf', async () => {
+  const shelfSite = site('shelf');
+  await openPage(`${shelfSite}/article/11`);
+  await openPage(`${shelfSite}/article/12`);
+  await openPage(`${base}/links`);
+  const [a] = await tabsFor(`${shelfSite}/article/11`);
+  const [b] = await tabsFor(`${shelfSite}/article/12`);
+  assert.deepEqual(await panel('shelve-tab', { tabId: a.id }), { ok: true });
+  assert.deepEqual(await panel('shelve-tab', { tabId: b.id }), { ok: true });
+  const { id } = await panel('archive-tab', { tabId: a.id });
+  await waitFor(async () => (await tabsFor(`${shelfSite}/article/11`)).length === 0, { what: 'the tab to close' });
+
+  assert.equal((await panel('restore-item', { id })).ok, true);
+  const [back] = await waitFor(async () => {
+    const tabs = await tabsFor(`${shelfSite}/article/11`);
+    return tabs.length === 1 && tabs;
+  }, { what: 'the tab to come back' });
+  assert.equal(back.groupId, -1, 'not inside the collapsed Shelf');
+  assert.equal(back.active, true);
+  const page = await findPage(`${shelfSite}/article/11`);
+  await waitFor(async () => (await page.evaluate(() => history.length)) >= 2, { what: 'its history to come back' });
+  const shelfTab = await tabById(b.id);
+  assert.notEqual(shelfTab.groupId, -1, 'the rest of the Shelf is untouched');
+});
+
+test('the first time Ebb tidies on its own, it explains when you come back', async () => {
+  await setIntro({ shelf: false, library: false });
+  const introSite = site('intro');
+  await openPage(`${introSite}/article/21`);
+  const front = await openPage(`${introSite}/article/22`);
+  await lifecycleAfter(200, { boundary: true }); // article 21 moves to the Shelf "while you are away"
+  const [tidied] = await tabsFor(`${introSite}/article/21`);
+  assert.notEqual(tidied.groupId, -1);
+
+  const win = await sw(() => chrome.windows.getLastFocused());
+  await sw((windowId) => globalThis.ebb.engine.dispatch('onFocus', windowId), win.id); // you are back
+  await waitFor(() => hasToast(front), { what: 'the explanation' });
+  await clickToastButton(front, 'Show me');
+  await waitFor(async () => (await sw((g) => chrome.tabGroups.get(g), tidied.groupId)).collapsed === false, { what: 'the Shelf to open' });
+  assert.equal(await sw(() => globalThis.ebb.engine.state.intro.shelf), true);
 });
 
 test('the service worker logged no errors', () => {
