@@ -196,3 +196,87 @@ test('messages of unknown types are ignored', async () => {
   assert.equal(await t.message({ type: 'something-else' }), undefined);
   assert.deepEqual(await t.act('no-such-action'), { ok: false, error: 'unknown action no-such-action' });
 });
+
+test('import uses the page address and keeps the newest copy even when a backup reuses its ID', async () => {
+  const t = await setup();
+  const tab = await t.open('https://example.com/notes');
+  const { id } = await t.act('archive-tab', { tabId: tab });
+  const [saved] = await t.items();
+  const backup = { ...saved, archivedAt: saved.archivedAt - 1000, title: 'Old notes' };
+  const alternate = { ...backup, id: 'another-copy', url: saved.url + '?utm_source=backup', key: 'obsolete-key' };
+  const response = await t.message({ type: 'panel:import', data: { app: 'ebb', library: [backup, alternate] } });
+  assert.equal(response.counts.library, 0);
+  assert.deepEqual(await t.items(), [saved]);
+  assert.equal(saved.id, id);
+});
+
+test('a refused close keeps the live tab, its previous Library entry, and the Later count', async () => {
+  const t = await setup();
+  const url = 'https://example.com/notes';
+  await t.act('archive-tab', { tabId: await t.open(url) });
+  const saved = await t.items();
+  const tabId = await t.open(url);
+  t.engine.p.tabs.remove = async () => false;
+  assert.equal((await t.act('archive-tab', { tabId })).ok, false);
+  assert.equal((await t.act('later-tab', { tabId })).ok, false);
+  assert.equal(t.rec(tabId).url, url);
+  assert.deepEqual(await t.items(), saved);
+  assert.deepEqual(await t.items('later'), []);
+  assert.equal(t.state.counts.later, 0);
+  assert.equal((await t.events('archive')).length, 1);
+  assert.equal((await t.events('later')).length, 0);
+  await t.close(tabId);
+  assert.equal(t.rec(tabId), undefined);
+});
+
+test('Fresh start leaves a tab in view if it was selected while its Library copy was being saved', async () => {
+  const t = await setup();
+  const url = 'https://example.com/reading';
+  const tabId = await t.open(url);
+  await t.open('https://example.com/other');
+  const put = t.browser.repo.put;
+  t.browser.repo.put = async (store, item, ...args) => {
+    await put(store, item, ...args);
+    if (store === 'library' && item.url === url) t.browser.activate(tabId);
+  };
+  assert.equal((await t.act('fresh-start')).count, 0);
+  assert.ok(t.tab(tabId).active);
+  assert.deepEqual(await t.items(), []);
+  assert.deepEqual(await t.events('archive'), []);
+});
+
+test('pressing Enter on free text opens the first suggestion, and a receipt suggestion can be opened', async () => {
+  const t = await setup();
+  const receipt = { id: 'receipt-1', reason: 'receipt', title: 'Trip receipt', url: 'https://example.com/receipt', archivedAt: 1 };
+  await t.message({ type: 'panel:import', data: { app: 'ebb', library: [receipt] } });
+  await t.engine.dispatch('addLater', { title: 'Trip checklist', url: 'https://example.com/checklist' });
+  const current = await t.open('https://example.com/start');
+  const choose = async (text) => {
+    const result = await t.engine.dispatch('omniboxEnter', text, 'currentTab', t.tab(current));
+    await t.settle();
+    assert.ok(result.ok);
+  };
+  const [first] = await t.engine.dispatch('omniboxSuggest', 'trip');
+  await choose('trip');
+  assert.equal(t.tab(current).url, first.content);
+  const [second] = await t.engine.dispatch('omniboxSuggest', 'receipt');
+  await choose(second.content);
+  assert.equal(t.tab(current).url, receipt.url);
+});
+
+test('Library and Later keep their entries if an existing tab cannot be selected or reopened', async () => {
+  const t = await setup();
+  const url = 'https://example.com/saved';
+  await t.open(url);
+  await t.open('https://example.com/other');
+  await t.message({ type: 'panel:import', data: {
+    app: 'ebb', library: [{ id: 'page', url, archivedAt: 1 }], later: [{ id: 'link', url, savedAt: 1 }],
+  } });
+  t.engine.p.tabs.update = async () => null;
+  t.engine.p.tabs.create = async () => null;
+  assert.equal((await t.act('restore-item', { id: 'page' })).ok, false);
+  assert.equal((await t.act('open-later', { id: 'link' })).ok, false);
+  assert.deepEqual((await t.items()).map((item) => item.id), ['page']);
+  assert.deepEqual((await t.items('later')).map((item) => item.id), ['link']);
+  assert.equal(t.state.counts.later, 1);
+});

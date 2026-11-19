@@ -1,8 +1,10 @@
 // A small promise wrapper over IndexedDB for the Library, the Later lane and the ledger.
 // Everything stays on this device.
 
+import { normalizeUrl } from './util.js';
+
 const DB_NAME = 'ebb';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 /**
  * Stores
@@ -11,12 +13,24 @@ const DB_VERSION = 2;
  *   ledger     one event per action, for the weekly numbers
  *   snapshots  text snippets of open pages, by normalized URL (kept out of the hot state)
  */
-function upgrade(db, tx) {
+function upgrade(db, tx, oldVersion) {
   const library = db.objectStoreNames.contains('library')
     ? tx.objectStore('library')
     : db.createObjectStore('library', { keyPath: 'id' });
   for (const index of ['archivedAt', 'url', 'batchId', 'huntId', 'key']) {
     if (!library.indexNames.contains(index)) library.createIndex(index, index);
+  }
+  if (oldVersion > 0 && oldVersion < 3) {
+    // Creating an index does not populate the missing key property on version 1 Library items.
+    const request = library.openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      const item = cursor.value;
+      const key = normalizeUrl(item.url);
+      if (key && item.key !== key) cursor.update({ ...item, key });
+      cursor.continue();
+    };
   }
   if (!db.objectStoreNames.contains('later')) {
     const s = db.createObjectStore('later', { keyPath: 'id' });
@@ -53,7 +67,7 @@ export function openRepo({ indexedDB = globalThis.indexedDB, IDBKeyRange = globa
   const db = () =>
     (opening ||= new Promise((resolve, reject) => {
       const request = indexedDB.open(name, DB_VERSION);
-      request.onupgradeneeded = () => upgrade(request.result, request.transaction);
+      request.onupgradeneeded = (event) => upgrade(request.result, request.transaction, event.oldVersion);
       request.onsuccess = () => {
         const d = request.result;
         d.onversionchange = () => {
@@ -77,9 +91,11 @@ export function openRepo({ indexedDB = globalThis.indexedDB, IDBKeyRange = globa
   };
 
   return {
-    async put(name, value) {
+    /** Write a record and remove any copies it replaces in the same transaction. */
+    async put(name, value, replacedIds = []) {
       const { tx, os } = await store(name, 'readwrite');
       os.put(value);
+      for (const id of replacedIds) os.delete(id);
       await done(tx);
     },
     async get(name, key) {

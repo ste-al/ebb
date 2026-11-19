@@ -47,6 +47,7 @@ export function emptyState() {
     pendingRestore: {}, // tabId -> { freeze, url }: scroll/media state to apply when that page loads
     pendingDiscard: {}, // tabId -> true: unload as soon as the page has its URL (undo of a batch)
     limbo: {}, // normalized URL -> [{ rec, at }] from windows that were closed
+    startupSession: null, // browser session whose startup event has already been handled
     startup: null,
     resume: null,
     lastBatch: null,
@@ -263,15 +264,24 @@ export class Engine {
       return !t || normalizeUrl(t.url || t.pendingUrl || '') !== normalizeUrl(r.url);
     }).length;
     if (missing > known.length / 2) await this.startup();
-    else this.reconcile(tabs);
+    else this.reconcile(tabs, { holdMissing: true });
   }
 
   /** Forget tabs that no longer exist and pick up ones Ebb has not seen. */
-  reconcile(tabs) {
-    const ids = new Set(tabs.map((t) => t.id));
-    for (const id of Object.keys(this.state.tabs)) {
-      if (!ids.has(Number(id))) delete this.state.tabs[id];
+  reconcile(tabs, { holdMissing = false } = {}) {
+    const byId = new Map(tabs.map((t) => [t.id, t]));
+    for (const [id, rec] of Object.entries(this.state.tabs)) {
+      const tab = byId.get(Number(id));
+      if (tab && (!holdMissing || !isWebUrl(rec.url) || normalizeUrl(tab.url || tab.pendingUrl) === normalizeUrl(rec.url))) continue;
+      // Most IDs matching can also mean Chrome reused some IDs on a real restart.
+      // Keep the unmatched records available until onStartup or the normal limbo timeout.
+      if (holdMissing && isWebUrl(rec.url)) (this.state.limbo[normalizeUrl(rec.url)] ||= []).push({ rec, at: this.now() });
+      delete this.state.tabs[id];
+      delete this.state.pendingRestore[id];
+      delete this.state.pendingDiscard[id];
+      delete this.state.spawns[id];
     }
+    this.state.activeByWindow = {};
     for (const t of tabs) {
       this.ensureRecord(t);
       if (t.active) this.state.activeByWindow[t.windowId] = t.id;
@@ -372,7 +382,7 @@ export class Engine {
 
   /** A restored tab may only get its URL after it was created: adopt it then. */
   lateAdopt(tab, rec) {
-    if (!rec.fresh || !this.state.startup) return rec;
+    if (!rec.fresh) return rec;
     const adopted = this.adopt(tab);
     if (!adopted) return rec;
     this.state.tabs[tab.id] = adopted;
@@ -386,7 +396,7 @@ export class Engine {
     if (!was) return;
     delete rec.wasStage;
     this.touch();
-    if ((was === 'resting' || was === 'shelved') && !tab.active && !unloaded(tab)) {
+    if ((was === 'resting' || was === 'shelved') && !unloaded(tab) && !protection(tab, rec, this.ctx())) {
       const d = await this.p.tabs.discard(tab.id);
       if (d) {
         if (d.id !== tab.id) this.replaceTabId(tab.id, d.id);
@@ -445,9 +455,22 @@ export class Engine {
     return this.settings.respectGroups && tab.groupId != null && tab.groupId !== -1 && !shelfIds.has(tab.groupId);
   }
 
-  async discoverShelves() {
-    const groups = await this.p.groups.query({});
-    for (const g of groups) if (isShelfTitle(g.title)) this.state.shelf[g.windowId] = g.id;
+  async discoverShelves(tabs) {
+    // Group IDs can change on restart. A group title alone is also a perfectly valid user-chosen name.
+    const records = [...Object.values(this.state.tabs), ...Object.values(this.state.startup?.prev || {}).flat()];
+    const shelvedUrls = new Set(records.filter((r) => r.stage === 'shelved').map((r) => normalizeUrl(r.url)));
+    if (!shelvedUrls.size) return;
+    const matches = new Map(); // every member of this group was on the Shelf
+    for (const tab of tabs) {
+      if (tab.groupId === -1 || matches.get(tab.groupId) === false) continue;
+      matches.set(tab.groupId, shelvedUrls.has(normalizeUrl(tab.url || tab.pendingUrl)));
+    }
+    const candidates = new Map();
+    for (const group of await this.p.groups.query({})) {
+      if (!matches.get(group.id) || !isShelfTitle(group.title) || group.color !== 'grey' || this.state.shelf[group.windowId] != null) continue;
+      candidates.set(group.windowId, candidates.has(group.windowId) ? null : group.id);
+    }
+    for (const [windowId, id] of candidates) if (id != null) this.state.shelf[windowId] = id;
   }
 
   // ---------------------------------------------------------------- install & startup
@@ -459,8 +482,8 @@ export class Engine {
     }
     this.state.clock.lastTickAt = this.now();
     if (reason === 'install') this.state.installedClock = this.activeMs;
-    await this.discoverShelves();
     const tabs = await this.p.tabs.query({ windowType: 'normal' });
+    await this.discoverShelves(tabs);
     this.reconcile(tabs);
     if (!this.state.startup) for (const t of tabs) this.state.tabs[t.id].fresh = false;
     return { webTabIds: tabs.filter((t) => isWebUrl(t.url) && !t.discarded).map((t) => t.id) };
@@ -469,16 +492,19 @@ export class Engine {
   /** Browser start: tab ids changed, so keep the old records by URL and adopt restored tabs. */
   async startup() {
     const now = this.now();
-    if (this.state.startup) {
-      if (now < this.state.startup.adoptUntil) return;
-      await this.finishStartup(); // an earlier restart nobody ticked past: save its leftovers first
-    }
+    const sessionId = await this.p.session?.get();
+    const previous = this.state.startup;
+    // Tab events can start recovery before onStartup. Only the same browser session shares that recovery.
+    if (sessionId != null ? this.state.startupSession === sessionId : previous && now < previous.adoptUntil) return;
     const prev = {};
     const keep = (rec) => {
       if (isWebUrl(rec.url)) (prev[normalizeUrl(rec.url)] ||= []).push(rec);
     };
     for (const rec of Object.values(this.state.tabs)) keep(rec);
     for (const list of Object.values(this.state.limbo)) for (const entry of list) keep(entry.rec);
+    // Chrome may quit again while it is still restoring tabs. Offer the not-yet-matched records
+    // to this session as well, after the more recent copies of any matching URLs.
+    for (const list of Object.values(previous?.prev || {})) for (const rec of list) keep(rec);
     Object.assign(this.state, {
       tabs: {},
       shelf: {},
@@ -488,11 +514,12 @@ export class Engine {
       pendingDiscard: {},
       limbo: {},
       resume: null,
+      startupSession: sessionId ?? null,
       startup: { at: now, adoptUntil: now + ADOPT_MS, prev, adoptedHunts: {}, batchId: this.p.id('batch'), dismissed: false },
     });
     this.state.clock = { ...this.state.clock, lastTickAt: now, focused: true, idle: 'active' };
-    await this.discoverShelves();
     const tabs = await this.p.tabs.query({ windowType: 'normal' });
+    await this.discoverShelves(tabs);
     for (const t of tabs) {
       const rec = this.ensureRecord(t);
       if (t.active) this.state.activeByWindow[t.windowId] = t.id;
@@ -506,16 +533,21 @@ export class Engine {
   async finishStartup() {
     const startup = this.state.startup;
     if (!startup) return;
-    this.state.startup = null;
-    for (const rec of Object.values(this.state.tabs)) rec.fresh = false;
-    const closedByHunt = {};
-    for (const list of Object.values(startup.prev)) {
-      for (const rec of list) {
+    const closedByHunt = (startup.closedByHunt ||= {});
+    for (const [url, list] of Object.entries(startup.prev)) {
+      while (list.length) {
+        const rec = list[0];
         await this.addToLibrary(await this.libraryItem(rec, { reason: 'session-end', batchId: startup.batchId }));
         const key = rec.huntId || '_';
         closedByHunt[key] = (closedByHunt[key] || 0) + 1;
+        list.shift();
+        this.touch();
       }
+      delete startup.prev[url];
     }
+    // If a Library write fails, the next tick can retry from the retained records.
+    this.state.startup = null;
+    for (const rec of Object.values(this.state.tabs)) rec.fresh = false;
     this.buildResume(startup, closedByHunt);
     this.touch();
   }
@@ -601,11 +633,11 @@ export class Engine {
 
       if (!unloaded(tab)) {
         const retryOk = rec.restFailedClock == null || this.activeMs - rec.restFailedClock >= REST_RETRY;
-        if (rests > 0 && retryOk) {
-          rests -= 1;
-          const rested = await this.rest(tab, rec);
-          if (rested) tab = rested;
-        }
+        if (!rests || !retryOk) continue;
+        rests -= 1;
+        const rested = await this.rest(tab, rec);
+        if (!rested) continue;
+        tab = rested;
       } else if (rec.stage === 'live') {
         rec.stage = 'resting';
         this.touch();
@@ -616,19 +648,17 @@ export class Engine {
         if (this.settings.useShelf) {
           if (await this.shelve(tab, rec, 'idle')) moves -= 1;
         } else if (target === 'archived') {
-          await this.archiveTab(tab, rec, { reason: 'idle' });
-          moves -= 1;
+          if (await this.archiveTab(tab, rec, { reason: 'idle' })) moves -= 1;
         }
       } else if (target === 'archived' && this.activeMs - (rec.shelvedClock ?? 0) >= MIN_SHELF_STAY) {
-        await this.archiveTab(tab, rec, { reason: 'idle' });
-        moves -= 1;
+        if (await this.archiveTab(tab, rec, { reason: 'idle' })) moves -= 1;
       }
     }
-    if (boundary && moves > 0) await this.applyBudget(moves);
+    if (boundary && moves > 0) await this.applyBudget(moves, rests);
   }
 
   /** Soft budget: when a window shows more tabs than the budget, shelve the longest-idle ones. */
-  async applyBudget(maxMoves) {
+  async applyBudget(maxMoves, rests = MAX_RESTS_PER_PASS) {
     const limit = this.settings.budget;
     if (!limit || !this.settings.useShelf || maxMoves <= 0) return;
     if (this.activeMs - this.state.installedClock < INSTALL_GRACE) return;
@@ -653,6 +683,10 @@ export class Engine {
         .sort((a, b) => a.rec.lastActiveClock - b.rec.lastActiveClock);
       for (const { t, rec } of candidates) {
         if (excess <= 0 || maxMoves <= 0) break;
+        if (!unloaded(t)) {
+          if (!rests || (rec.restFailedClock != null && this.activeMs - rec.restFailedClock < REST_RETRY)) continue;
+          rests -= 1;
+        }
         if (await this.shelve(t, rec, 'budget')) {
           excess -= 1;
           maxMoves -= 1;
@@ -665,14 +699,13 @@ export class Engine {
 
   /**
    * Ask the page for its scroll position, media time and (once per URL) a short excerpt.
-   * Skipped when the state was already captured after you last used the tab.
+   * Read the current dirty flag even when an earlier capture already has the excerpt.
    */
   async captureInto(tab, rec, timeout = CAPTURE_TIMEOUT) {
     if (!tab || unloaded(tab) || !isWebUrl(tab.url)) return false;
     const wantText = this.settings.captureText && rec.excerptUrl !== tab.url;
-    if (!wantText && rec.freeze && rec.freeze.at >= rec.lastActiveAt) return true;
     const res = await this.p.tabs.sendMessage(tab.id, { type: 'ebb:capture', text: wantText }, timeout);
-    if (!res || typeof res !== 'object') return false;
+    if (!res || typeof res !== 'object' || (res.url && res.url !== tab.url)) return false;
     await this.applyCaptureResult(rec, res, tab.url, wantText);
     return true;
   }
@@ -719,16 +752,27 @@ export class Engine {
 
   async applyCapture(tabId, res, req) {
     const rec = this.state.tabs[tabId];
-    if (!rec || normalizeUrl(rec.url) !== normalizeUrl(req.url)) return;
+    if (!rec || rec.url !== req.url || (res.url && res.url !== req.url)) return;
     await this.applyCaptureResult(rec, res, req.url, req.text);
   }
 
   // ---------------------------------------------------------------- actions on tabs
 
+  /** Recheck Chrome after page and storage calls. A tab may have moved, navigated or become active meanwhile. */
+  async actionTab(tab, rec, { move = false, individual = false, url = tab.url || tab.pendingUrl } = {}) {
+    const current = await this.p.tabs.get(tab.id);
+    if (!current || !isWebUrl(url) || (current.pendingUrl || current.url) !== url || current.pinned || rec.dirty) return null;
+    // A direct command on one tab may target the current tab or one the user normally keeps.
+    if (!individual && (protection(current, rec, this.ctx({ paused: false })) || (move && this.heldByGroup(current)))) return null;
+    return current;
+  }
+
   /** Unload a tab in place. It stays where it is and reloads when clicked. */
-  async rest(tab, rec) {
+  async rest(tab, rec, { individual = false } = {}) {
     await this.captureInto(tab, rec);
-    if (rec.dirty) return null; // the page just told us it has unsaved input
+    const current = await this.actionTab(tab, rec, { individual });
+    if (!current || current.active) return null;
+    if (unloaded(current)) return current;
     const result = await this.p.tabs.discard(tab.id);
     if (!result) {
       rec.restFailedClock = this.activeMs;
@@ -744,13 +788,15 @@ export class Engine {
   }
 
   /** Move a tab into the window's collapsed Shelf group, one click away. */
-  async shelve(tab, rec, reason) {
+  async shelve(tab, rec, reason, { individual = false } = {}) {
     if (!unloaded(tab) && !tab.active) {
-      const rested = await this.rest(tab, rec);
+      const rested = await this.rest(tab, rec, { individual });
       if (rested) tab = rested;
-      else if (rec.dirty) return false;
+      else if (!individual) return false;
     }
-    const groupId = await this.addToShelf(tab.windowId, tab.id);
+    const current = await this.actionTab(tab, rec, { move: true, individual });
+    if (!current || current.active) return false;
+    const groupId = await this.addToShelf(current.windowId, current.id);
     if (groupId == null) return false;
     rec.stage = 'shelved';
     rec.shelvedAt = this.now();
@@ -809,44 +855,61 @@ export class Engine {
   }
 
   /** Save to the Library, keeping one entry per page: an older entry for the same page is folded in. */
-  async addToLibrary(item) {
-    if (item.reason !== 'receipt' && item.key) {
-      for (const old of await this.p.repo.findBy('library', 'key', item.key)) {
-        if (old.reason === 'receipt' || old.id === item.id) continue;
-        item.excerpt ||= old.excerpt || '';
-        item.description ||= old.description || '';
-        item.freeze ||= old.freeze || null;
-        item.visits = Math.max(item.visits || 0, old.visits || 0);
-        await this.p.repo.delete('library', old.id);
-      }
+  async addToLibrary(item, { preferNewer = false, alreadySaved = false } = {}) {
+    item.key = normalizeUrl(item.url);
+    const copies = item.reason === 'receipt' ? [] : (await this.p.repo.findBy('library', 'key', item.key))
+      .filter((old) => old.reason !== 'receipt' && !(alreadySaved && old.id === item.id))
+      .sort((a, b) => b.archivedAt - a.archivedAt);
+    if (preferNewer && copies.some((old) => old.archivedAt >= item.archivedAt)) return null;
+    for (const old of copies) {
+      item.excerpt ||= old.excerpt || '';
+      item.description ||= old.description || '';
+      item.freeze ||= old.freeze || null;
+      item.visits = Math.max(item.visits || 0, old.visits || 0);
     }
-    await this.p.repo.put('library', item);
+    const oldIds = copies.map((old) => old.id).filter((id) => id !== item.id);
+    if (!alreadySaved || oldIds.length) await this.p.repo.put('library', item, oldIds);
     return item;
   }
 
   async findLibraryItemByUrl(url) {
-    const key = normalizeUrl(url);
-    const [byKey] = (await this.p.repo.findBy('library', 'key', key)).filter((i) => i.reason !== 'receipt');
-    if (byKey) return byKey;
-    return (await this.p.repo.getAll('library')).find((i) => i.reason !== 'receipt' && normalizeUrl(i.url) === key) || null;
+    const copies = await this.p.repo.findBy('library', 'key', normalizeUrl(url));
+    copies.sort((a, b) => b.archivedAt - a.archivedAt);
+    return copies.find((item) => item.url === url) || copies[0] || null;
   }
 
   /** Close a tab into the Library, keeping where you were and a text excerpt. */
-  async archiveTab(tab, rec, { reason, batchId = null, type = 'archive', capture = true } = {}) {
-    if (capture && tab && tab.status === 'complete') await this.captureInto(tab, rec, 400);
-    const item = await this.addToLibrary(await this.libraryItem(rec, { reason, batchId }));
-    if (tab) {
-      await this.leaveShelfIfLast(tab);
-      this.expectedRemovals.add(tab.id);
-      await this.p.tabs.remove(tab.id);
+  async archiveTab(tab, rec, { reason, batchId = null, type = 'archive' } = {}) {
+    if (tab.status === 'complete') await this.captureInto(tab, rec, 400);
+    if (rec.dirty) return null;
+    const item = await this.libraryItem(rec, { reason, batchId });
+    // Keep a recoverable copy before closing. Leave any older Library entry intact until Chrome succeeds.
+    await this.p.repo.put('library', item);
+    if (!(await this.closeSavedTab(tab, rec, { individual: reason === 'manual' }))) {
+      await this.p.repo.delete('library', item.id);
+      return null;
     }
-    delete this.state.tabs[rec.tabId];
-    delete this.state.pendingRestore[rec.tabId];
-    delete this.state.pendingDiscard[rec.tabId];
-    this.touch();
+    await this.addToLibrary(item, { alreadySaved: true });
     await this.log({ type, from: rec.stage, host: hostOf(rec.url), reason });
     if (reason === 'idle') this.noteIntro('library');
     return item;
+  }
+
+  /** Close only the page that was saved, and keep its live record if Chrome refuses. */
+  async closeSavedTab(tab, rec, options) {
+    const current = await this.actionTab(tab, rec, { move: true, ...options });
+    if (!current) return false;
+    await this.leaveShelfIfLast(current);
+    this.expectedRemovals.add(tab.id);
+    if (!(await this.p.tabs.remove(tab.id))) {
+      this.expectedRemovals.delete(tab.id);
+      return false;
+    }
+    delete this.state.tabs[tab.id];
+    delete this.state.pendingRestore[tab.id];
+    delete this.state.pendingDiscard[tab.id];
+    this.touch();
+    return true;
   }
 
   // ---------------------------------------------------------------- first-time explanations
@@ -986,13 +1049,8 @@ export class Engine {
     const item = await this.p.repo.get('library', id);
     if (!item || !isWebUrl(item.url)) return null;
     if (!restUnloaded) {
-      const open = await this.findOpenTab(item.url);
+      const open = await this.reuseOpenTab(item.url, active);
       if (open) {
-        // Already open again: go there rather than opening it twice.
-        if (active) {
-          await this.p.tabs.update(open.id, { active: true });
-          await this.p.windows.update(open.windowId, { focused: true });
-        }
         await this.p.repo.delete('library', id);
         await this.log({ type: 'restore', from, host: hostOf(item.url) });
         this.touch();
@@ -1050,11 +1108,17 @@ export class Engine {
     return tab;
   }
 
-  /** An open tab showing this page, if there is one. */
-  async findOpenTab(url) {
+  /** Use an existing tab only if it is still opening or showing the requested page. */
+  async reuseOpenTab(url, active) {
     const key = normalizeUrl(url);
     const tabs = await this.p.tabs.query({ windowType: 'normal' });
-    return tabs.find((t) => normalizeUrl(t.url || t.pendingUrl || '') === key) || null;
+    const matches = (t) => t && normalizeUrl(t.pendingUrl || t.url || '') === key;
+    const open = tabs.find(matches);
+    if (!open || !active) return open || null;
+    const selected = await this.p.tabs.update(open.id, { active: true });
+    if (!matches(selected)) return null;
+    const focused = await this.p.windows.update(selected.windowId, { focused: true });
+    return focused ? selected : null;
   }
 
   /**
@@ -1398,9 +1462,10 @@ export class Engine {
     const info = await this.p.tabs.sendMessage(sourceTabId, { type: 'ebb:link-info', url }, 300);
     const title = (info && typeof info.text === 'string' && info.text) || prettyUrl(url);
     const item = await this.addLater({ url, title, source: { url: src.url, title: src.title || '', huntId: src.huntId || null } });
-    this.expectedRemovals.add(tabId);
-    await this.p.tabs.remove(tabId);
-    delete this.state.tabs[tabId];
+    if (!(await this.closeSavedTab(tab, rec, { url }))) {
+      await this.removeLater(item.id);
+      return;
+    }
     await this.log({ type: 'later', host: hostOf(url) });
     this.toast(sourceTabId, {
       text: `Saved to Later: ${title}`,
@@ -1422,45 +1487,32 @@ export class Engine {
   async openLater(id, { active = true, windowId, opener, intoTabId } = {}) {
     const item = await this.p.repo.get('later', id);
     if (!item) return null;
-    const open = await this.findOpenTab(item.url);
-    if (open) {
-      if (active) {
-        await this.p.tabs.update(open.id, { active: true });
-        await this.p.windows.update(open.windowId, { focused: true });
+    let tab = await this.reuseOpenTab(item.url, active);
+    if (!tab) {
+      if (intoTabId != null) tab = await this.p.tabs.update(intoTabId, { url: item.url, active: true });
+      if (!tab) {
+        const props = opener
+          ? { url: item.url, active, windowId: opener.windowId, index: opener.index + 1, openerTabId: opener.id }
+          : await this.placeNewTab({ url: item.url, active }, windowId);
+        tab = await this.createTab(props);
       }
-      await this.p.repo.delete('later', id);
-      this.state.counts.later = Math.max(0, (this.state.counts.later || 0) - 1);
-      await this.log({ type: 'open-later', host: hostOf(item.url) });
-      this.touch();
-      return open;
+      if (!tab) return null;
+      const rec = this.ensureRecord(tab);
+      if (item.source?.huntId && this.state.hunts[item.source.huntId]) {
+        rec.huntId = item.source.huntId;
+        rec.keepHuntOnce = true;
+      }
+      rec.restored = true;
+      rec.fresh = false;
     }
-    let tab;
-    if (intoTabId != null) {
-      tab = await this.p.tabs.update(intoTabId, { url: item.url, active: true });
-    } else {
-      const props = opener
-        ? { url: item.url, active, windowId: opener.windowId, index: opener.index + 1, openerTabId: opener.id }
-        : await this.placeNewTab({ url: item.url, active }, windowId);
-      tab = await this.createTab(props);
-    }
-    if (!tab) return null;
-    const rec = this.ensureRecord(tab);
-    if (item.source?.huntId && this.state.hunts[item.source.huntId]) {
-      rec.huntId = item.source.huntId;
-      rec.keepHuntOnce = true;
-    }
-    rec.restored = true;
-    rec.fresh = false;
-    await this.p.repo.delete('later', id);
-    this.state.counts.later = Math.max(0, (this.state.counts.later || 0) - 1);
+    await this.removeLater(id);
     await this.log({ type: 'open-later', host: hostOf(item.url) });
-    this.touch();
     return tab;
   }
 
   async removeLater(id) {
     await this.p.repo.delete('later', id);
-    this.state.counts.later = (await this.p.repo.getAll('later')).length;
+    this.state.counts.later = await this.p.repo.count('later');
     this.touch();
   }
 
@@ -1489,17 +1541,20 @@ export class Engine {
       await this.p.repo.delete('later', item.id);
       await this.log({ type: 'archive', from: 'later', host: hostOf(item.url), reason: 'later-expired' });
     }
-    this.state.counts.later = (await this.p.repo.getAll('later')).length;
+    this.state.counts.later = await this.p.repo.count('later');
     this.touch();
   }
 
   async sendTabToLater(tab) {
     if (!tab || !isWebUrl(tab.url) || tab.pinned) return null;
     const rec = this.ensureRecord(tab);
+    if (tab.status === 'complete') await this.captureInto(tab, rec, 400);
+    if (rec.dirty) return null;
     const item = await this.addLater({ url: tab.url, title: tab.title || rec.title, source: { url: '', title: '', huntId: rec.huntId || null } });
-    this.expectedRemovals.add(tab.id);
-    await this.p.tabs.remove(tab.id);
-    delete this.state.tabs[tab.id];
+    if (!(await this.closeSavedTab(tab, rec, { individual: true }))) {
+      await this.removeLater(item.id);
+      return null;
+    }
     await this.log({ type: 'later', host: hostOf(tab.url) });
     this.touch();
     return item;
@@ -1526,9 +1581,9 @@ export class Engine {
     const entries = (await this.huntTabs(huntId)).filter(({ tab }) => tab.id !== exceptTabId);
     let count = 0;
     for (const { tab, rec } of entries) {
-      await this.archiveTab(tab, rec, { reason: 'mission', batchId, type: 'tuck' });
-      count += 1;
+      if (await this.archiveTab(tab, rec, { reason: 'mission', batchId, type: 'tuck' })) count += 1;
     }
+    if (!count) return { count };
     if (exceptTabId != null) {
       const receiptTab = await this.p.tabs.get(exceptTabId);
       if (receiptTab && isWebUrl(receiptTab.url)) {
@@ -1559,9 +1614,9 @@ export class Engine {
     for (const tab of tabs) {
       const rec = this.ensureRecord(tab);
       if (protection(tab, rec, ctx) || this.heldByGroup(tab, shelfIds)) continue;
-      await this.archiveTab(tab, rec, { reason: 'fresh-start', batchId, capture: false });
-      count += 1;
+      if (await this.archiveTab(tab, rec, { reason: 'fresh-start', batchId })) count += 1;
     }
+    if (!count) return { count };
     this.state.lastBatch = { id: batchId, kind: 'fresh-start', at: this.now(), count, label: `Fresh start: ${plural(count, 'tab')} moved to the Library` };
     this.touch();
     return { count, batchId };
@@ -1811,20 +1866,20 @@ export class Engine {
       case 'shelve-tab': {
         const tab = await this.p.tabs.get(msg.tabId);
         if (!tab || tab.active || tab.pinned || !isWebUrl(tab.url)) return { ok: false };
-        return { ok: await this.shelve(tab, this.ensureRecord(tab), 'manual') };
+        return { ok: await this.shelve(tab, this.ensureRecord(tab), 'manual', { individual: true }) };
       }
       case 'archive-tab': {
         const tab = await this.p.tabs.get(msg.tabId);
         if (!tab || tab.pinned || !isWebUrl(tab.url)) return { ok: false };
         const item = await this.archiveTab(tab, this.ensureRecord(tab), { reason: 'manual' });
-        return { ok: true, id: item.id };
+        return item ? { ok: true, id: item.id } : { ok: false, error: 'Ebb could not close this tab into the Library.' };
       }
       case 'keep-tab':
         return this.keepTab(msg.tabId, msg.mode ?? null);
       case 'later-tab': {
         const tab = await this.p.tabs.get(msg.tabId);
         const item = await this.sendTabToLater(tab);
-        return item ? { ok: true, id: item.id } : { ok: false };
+        return item ? { ok: true, id: item.id } : { ok: false, error: 'Ebb could not send this tab to Later.' };
       }
       case 'shelve-hunt':
         return { count: await this.shelveWhere((rec) => rec.huntId === msg.huntId) };
@@ -1872,14 +1927,18 @@ export class Engine {
 
   // ---------------------------------------------------------------- address bar: "ebb <words>"
 
+  async matchingLater(q) {
+    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+    return (await this.p.repo.getAll('later'))
+      .filter((i) => !i.openedAt && terms.every((t) => `${i.title} ${i.url}`.toLowerCase().includes(t)))
+      .sort((a, b) => b.savedAt - a.savedAt);
+  }
+
   /** Suggestions while you type: Later links first, then Library pages, best matches first. */
   async omniboxSuggest(text) {
     const q = String(text || '').trim();
     if (!q) return [];
-    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
-    const later = (await this.p.repo.getAll('later'))
-      .filter((i) => terms.every((t) => `${i.title} ${i.url}`.toLowerCase().includes(t)))
-      .sort((a, b) => b.savedAt - a.savedAt)
+    const later = (await this.matchingLater(q))
       .slice(0, 2)
       .map((i) => ({ url: i.url, title: i.title, where: 'Later' }));
     const library = (await this.library({ q, limit: 8 })).items.map((i) => ({
@@ -1904,16 +1963,12 @@ export class Engine {
   async omniboxEnter(text, disposition = 'currentTab', current = null) {
     const q = String(text || '').trim();
     if (!q) return { ok: false };
-    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
-    const laterItems = await this.p.repo.getAll('later');
-    let later = null;
+    const laterItems = await this.matchingLater(q);
+    const address = isWebUrl(q);
+    const later = address ? laterItems.find((i) => i.url === q) : laterItems[0];
     let item = null;
-    if (isWebUrl(q)) {
-      later = laterItems.find((i) => i.url === q) || null;
-      if (!later) item = await this.findLibraryItemByUrl(q);
-    } else {
-      [item = null] = (await this.library({ q, limit: 1 })).items;
-      if (!item) later = laterItems.find((i) => terms.every((t) => `${i.title} ${i.url}`.toLowerCase().includes(t))) || null;
+    if (!later) {
+      item = address ? await this.findLibraryItemByUrl(q) : (await this.library({ q, limit: 1 })).items[0];
     }
     const active = disposition !== 'newBackgroundTab';
     const intoTabId = disposition === 'currentTab' && current && !current.pinned ? current.id : undefined;
@@ -2059,12 +2114,13 @@ export class Engine {
       let added = 0;
       for (const item of items) {
         if (store === 'library') {
-          item.key ||= normalizeUrl(item.url);
-          // Keep whichever copy of a page was closed last.
-          const existing = await this.p.repo.findBy('library', 'key', item.key);
-          const newer = existing.some((e) => e.reason !== 'receipt' && e.id !== item.id && e.archivedAt >= item.archivedAt);
-          if (item.reason !== 'receipt' && newer) continue;
-          await this.addToLibrary(item);
+          const saved = await this.p.repo.get('library', item.id);
+          if (saved) {
+            const samePage = normalizeUrl(saved.url) === normalizeUrl(item.url);
+            const sameKind = (saved.reason === 'receipt') === (item.reason === 'receipt');
+            if (!samePage || !sameKind || saved.archivedAt >= item.archivedAt) continue;
+          }
+          if (!(await this.addToLibrary({ ...item }, { preferNewer: true }))) continue;
         } else {
           await this.p.repo.put(store, item);
         }
@@ -2077,7 +2133,7 @@ export class Engine {
         if (!this.state.hunts[id] && hunt && typeof hunt === 'object' && hunt.id === id) this.state.hunts[id] = hunt;
       }
     }
-    this.state.counts.later = (await this.p.repo.getAll('later')).length;
+    this.state.counts.later = await this.p.repo.count('later');
     this.touch();
     return { ok: true, counts };
   }

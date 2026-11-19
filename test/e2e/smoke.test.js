@@ -227,10 +227,12 @@ test('leaving a page captures your place; resting, the Shelf and coming back wor
   await openPage(`${base}/article/2`); // switching tabs captures article 1
   const [t1] = await tabsFor(`${base}/article/1`);
 
-  const rec = await waitFor(() => sw((id) => globalThis.ebb.engine.state.tabs[id]?.freeze?.scrollY > 1000 && globalThis.ebb.engine.state.tabs[id], t1.id), {
-    what: 'the scroll position to be captured',
+  await waitFor(() => sw((id) => {
+    const rec = globalThis.ebb.engine.state.tabs[id];
+    return rec?.freeze?.scrollY > 1000 && rec.excerptUrl === rec.url;
+  }, t1.id), {
+    what: 'both the scroll position and the text snippet to be saved',
   });
-  assert.ok(rec.excerptUrl, 'a text snippet was kept');
   const snapshot = (await repo('snapshots')).find((x) => x.url === `${base}/article/1`);
   assert.match(snapshot.excerpt, /The tide comes in/);
   assert.equal(snapshot.description, 'Article 1: a page for testing Ebb.');
@@ -414,6 +416,28 @@ test('the first time Ebb tidies on its own, it explains when you come back', asy
   await clickToastButton(front, 'Show me');
   await waitFor(async () => (await sw((g) => chrome.tabGroups.get(g), tidied.groupId)).collapsed === false, { what: 'the Shelf to open' });
   assert.equal(await sw(() => globalThis.ebb.engine.state.intro.shelf), true);
+});
+
+test('editable text stays out of page snippets and confirmation signals', async () => {
+  const url = `${base}/article/31`;
+  const page = await openPage(url);
+  const [tab] = await tabsFor(url);
+  const capture = () => sw((id) => chrome.tabs.sendMessage(id, { type: 'ebb:capture', text: true }), tab.id);
+  await page.evaluate(() => {
+    document.querySelector('article').innerHTML =
+      '<h1>Published article</h1><div contenteditable><h2>Private heading</h2></div>' +
+      '<div contenteditable="plaintext-only" id="draft"></div><p>Published ending</p>';
+  });
+  await page.type('#draft', 'Private draft 2468');
+  const snippet = await capture();
+  assert.equal(snippet.dirty, true, 'the editor still protects the tab');
+  assert.equal(snippet.excerpt, 'Published article Published ending');
+  const signals = await sw((id) => chrome.tabs.sendMessage(id, { type: 'ebb:signals', reference: '2468' }), tab.id);
+  assert.deepEqual(signals.headings, ['Published article']);
+  assert.equal(signals.hasReference, false);
+  await page.evaluate(() => { document.querySelector('main').contentEditable = 'true'; });
+  assert.equal((await capture()).excerpt, '', 'the chosen article can itself be inside an editor');
+  await page.close();
 });
 
 test('the service worker logged no errors', () => {

@@ -125,19 +125,19 @@
 
   // ---------------------------------------------------------------- reading the page
 
-  const SKIP_FOR_EXCERPT = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'CANVAS', 'IFRAME', 'NAV', 'HEADER', 'FOOTER', 'ASIDE', 'FORM', 'BUTTON', 'SELECT', 'OPTION', 'TEXTAREA', 'INPUT']);
-  const SKIP_FOR_SIGNALS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'CANVAS', 'IFRAME']);
+  const SKIP_FOR_SIGNALS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'CANVAS', 'IFRAME', 'SELECT', 'OPTION', 'TEXTAREA', 'INPUT']);
+  const SKIP_FOR_EXCERPT = new Set([...SKIP_FOR_SIGNALS, 'NAV', 'HEADER', 'FOOTER', 'ASIDE', 'FORM', 'BUTTON']);
 
   /** Visible-ish text under root, up to about max characters. Cheap: stops early. */
   function collectText(root, max, skip) {
     if (!root) return '';
+    const excluded = (el) => el.isContentEditable || skip.has(el.tagName.toUpperCase()) || el.hidden || el.getAttribute('aria-hidden') === 'true';
+    // TreeWalker filters descendants only. The chosen article or heading can itself be inside an editor.
+    for (let el = root; el; el = el.parentElement) if (excluded(el)) return '';
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         if (node.nodeType === Node.ELEMENT_NODE) {
-          if (skip.has(node.tagName.toUpperCase()) || node.hidden || node.getAttribute('aria-hidden') === 'true') {
-            return NodeFilter.FILTER_REJECT;
-          }
-          return NodeFilter.FILTER_SKIP;
+          return excluded(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
         }
         return NodeFilter.FILTER_ACCEPT;
       },
@@ -174,6 +174,7 @@
     const range = Math.max(1, (doc?.scrollHeight || 0) - window.innerHeight);
     recompute();
     const out = {
+      url: location.href,
       scrollY: Math.round(window.scrollY),
       scrollRatio: Math.min(1, window.scrollY / range),
       title: document.title,
@@ -191,7 +192,7 @@
   function signals(source, flags) {
     const headings = [...document.querySelectorAll('h1, h2, [role="heading"], [role="alert"], [role="status"]')]
       .slice(0, 12)
-      .map((h) => clean(h.innerText || h.textContent, 200))
+      .map((h) => clean(collectText(h, 200, SKIP_FOR_SIGNALS), 200))
       .filter(Boolean);
     let hasReference = false;
     try {

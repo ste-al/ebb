@@ -45,8 +45,14 @@ test('upgrading from version 1 keeps the data and adds the new store and index',
   });
   const repo = openRepo({ indexedDB, IDBKeyRange, name });
   assert.equal((await repo.get('library', 'old')).url, 'https://a.example/');
+  assert.deepEqual((await repo.findBy('library', 'key', 'https://a.example/')).map((r) => r.id), ['old']);
+  await assert.rejects(repo.put('library', { url: 'https://a.example/' }, ['old']));
+  assert.equal((await repo.get('library', 'old')).archivedAt, 1, 'a failed replacement keeps the original');
   await repo.put('library', { id: 'new', url: 'https://b.example/', key: 'https://b.example/', archivedAt: 2 });
   assert.deepEqual((await repo.findBy('library', 'key', 'https://b.example/')).map((r) => r.id), ['new']);
+  await repo.put('library', { id: 'replacement', url: 'https://a.example/', key: 'https://a.example/', archivedAt: 3 }, ['old']);
+  assert.deepEqual((await repo.findBy('library', 'key', 'https://a.example/')).map((r) => r.id), ['replacement']);
+  assert.equal(await repo.count('library'), 2);
   await repo.put('snapshots', { id: 'https://b.example/', excerpt: 'text' });
   assert.equal((await repo.get('snapshots', 'https://b.example/')).excerpt, 'text');
 });

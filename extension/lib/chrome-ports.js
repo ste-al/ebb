@@ -46,7 +46,7 @@ export function chromePorts() {
       create: (props) => quiet(chrome.tabs.create(props)),
       update: (id, props) => quiet(chrome.tabs.update(id, props)),
       move: (id, props) => quiet(chrome.tabs.move(id, props)),
-      remove: (id) => quiet(chrome.tabs.remove(id)),
+      remove: (id) => chrome.tabs.remove(id).then(() => true, () => false),
       discard: (id) => quiet(chrome.tabs.discard(id)),
       group: (options) => chrome.tabs.group(options),
       ungroup: (ids) => quiet(chrome.tabs.ungroup(ids)),

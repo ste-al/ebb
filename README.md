@@ -99,6 +99,8 @@ You can change these at `chrome://extensions/shortcuts`. Right-click menus offer
 
 Ebb makes no network requests and has no analytics. Everything it keeps (tab records, the Library, Later, the ledger) stays in the extension's local storage on this device, and is removed when you uninstall it. The address-bar search only looks through that same local data. Text snippets can be turned off in Settings, which also deletes the snippets kept for open tabs. Export/import gives you all your data as a JSON file.
 
+Page snippets and confirmation scans skip text in form fields and rich-text editors. Ebb can still use the presence of unsaved typing to keep a tab open.
+
 | Permission | Why Ebb needs it |
 | --- | --- |
 | `tabs`, `tabGroups` | See your tabs, unload them, and keep the Shelf group |
