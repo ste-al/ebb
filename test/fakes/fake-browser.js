@@ -29,7 +29,10 @@ export function memoryRepo(stores = {}) {
   const store = (name) => (stores[name] ||= new Map());
   return {
     stores,
-    put: async (name, value) => void store(name).set(value.id, clone(value)),
+    put: async (name, value, replacedIds = []) => {
+      store(name).set(value.id, clone(value));
+      for (const id of replacedIds) store(name).delete(id);
+    },
     get: async (name, key) => clone(store(name).get(key)) ?? null,
     getAll: async (name) => [...store(name).values()].map(clone),
     delete: async (name, key) => void store(name).delete(key),
@@ -149,7 +152,7 @@ export class FakeBrowser {
     const page = tab.page;
     switch (msg.type) {
       case 'ebb:capture': {
-        const out = { scrollY: page.scrollY, scrollRatio: page.scrollRatio, title: tab.title, media: clone(page.media), dirty: page.dirty };
+        const out = { url: tab.url, scrollY: page.scrollY, scrollRatio: page.scrollRatio, title: tab.title, media: clone(page.media), dirty: page.dirty };
         if (msg.text) Object.assign(out, { excerpt: page.excerpt, description: page.description });
         return out;
       }

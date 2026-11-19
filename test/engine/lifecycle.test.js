@@ -77,6 +77,21 @@ test('unsaved input reported by the page protects the tab until it is cleared', 
   assert.equal(t.tab(form).discarded, true);
 });
 
+test('a last-minute draft survives direct-to-Library tidying even after an earlier clean capture', async () => {
+  const t = await setup({ settings: { useShelf: false } });
+  const draft = await t.open('https://example.com/compose');
+  await t.open('https://example.com/reading');
+  assert.ok(t.rec(draft).freeze);
+  t.browser.type(draft);
+  t.state.clock.activeMs += 25 * HOUR;
+  await t.stepAway();
+  assert.ok(t.tab(draft));
+  assert.equal(t.tab(draft).discarded, false);
+  assert.equal(t.rec(draft).dirty, true);
+  assert.deepEqual(await t.items(), []);
+  assert.deepEqual(await t.events('rest'), []);
+});
+
 test('the clock only runs while Chrome is focused and you are at the keyboard', async () => {
   const t = await setup();
   await t.use(10);

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Tidying, Fresh start and task completion check the page for unsaved typing before discarding or closing it. If Chrome refuses a close or the user selects a tab during a batch, Ebb keeps the live tab and counts only completed actions.
+- Page snippets and confirmation checks skip editable text, including articles and headings inside rich-text editors.
+- Restarting Chrome during tab recovery preserves task membership across both launches. Recovery can resume after an interrupted Library write.
+- Ebb checks restored group membership before reclaiming its Shelf, so a user-created group can share its name.
+- Library imports compare the page address and save time, including for older backups and entries with the same ID. Replacing older copies uses one database transaction.
+- Pressing Enter on an address-bar search follows the first suggestion. Saved confirmation receipts can also be opened from their suggested address.
+
 ## 0.2.0
 
 ### New

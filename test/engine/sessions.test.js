@@ -63,6 +63,59 @@ test('the restart is noticed even if tab events arrive before onStartup', async 
   assert.equal(t2.rec(late).huntId, hunt, 'a late onStartup changes nothing');
 });
 
+test('a second browser launch during adoption matches both generations of tabs to their new IDs', async () => {
+  const t1 = await setup();
+  const urls = ['first', 'second', 'missing'].map((name) => `https://example.com/${name}`);
+  const hunts = [];
+  for (const url of urls) hunts.push(t1.rec(await t1.open(url)).huntId);
+  const b2 = nextSession(t1.browser, { restore: [{ url: urls[0], active: true }] });
+  const t2 = await connect(b2);
+  await t2.engine.dispatch('startup');
+  const b3 = nextSession(b2, {
+    firstId: 900, after: MIN, restore: [{ url: urls[0], active: true }, { url: urls[1] }],
+  });
+  const t3 = await connect(b3);
+  await t3.engine.dispatch('startup');
+  await t3.settle();
+  assert.deepEqual(b3.strip().map((id) => t3.rec(id)?.huntId), hunts.slice(0, 2));
+  assert.equal(t3.rec(500), undefined);
+  await t3.use(3);
+  assert.deepEqual((await t3.items()).map((i) => i.url), [urls[2]]);
+  await t3.engine.dispatch('startup');
+  assert.equal(t3.state.startup, null, 'a late startup event from this session does not reopen recovery');
+});
+
+test('reused tab IDs leave missing pages available to the browser startup event', async () => {
+  const t1 = await setup();
+  const urls = ['kept', 'reused', 'missing'].map((name) => `https://example.com/${name}`);
+  for (const url of urls) await t1.open(url);
+  const browser = nextSession(t1.browser, { firstId: 1, restore: [{ url: urls[0], active: true }, { url: urls[1] }] });
+  const t2 = await connect(browser);
+  await t2.engine.dispatch('startup');
+  await t2.use(3);
+  assert.deepEqual((await t2.items()).map((item) => item.url), [urls[2]]);
+});
+
+test('a restored user group named Shelf stays independent of Ebb’s own Shelf', async () => {
+  const t1 = await setup();
+  const shelved = await t1.open('https://example.com/shelved');
+  await t1.open('https://example.com/mine');
+  await t1.act('shelve-tab', { tabId: shelved });
+  const b2 = nextSession(t1.browser, { restore: [
+    { url: 'https://example.com/shelved' }, { url: 'https://example.com/mine', active: true },
+  ] });
+  const [own, mine] = b2.strip().map((id) => {
+    const groupId = b2.groupTabs({ tabIds: [id] });
+    Object.assign(b2.groups.get(groupId), { title: 'Shelf · 1', color: 'grey' });
+    return groupId;
+  });
+  const t2 = await connect(b2);
+  await t2.engine.dispatch('startup');
+  await t2.settle();
+  assert.equal(t2.state.shelf[b2.focusedWindow], own);
+  assert.equal(t2.tab(b2.strip()[1]).groupId, mine);
+});
+
 test('reloading the extension is not mistaken for a browser restart', async () => {
   const t1 = await setup();
   const a = await t1.open('https://example.com/a', { transition: 'typed' });
@@ -76,6 +129,29 @@ test('reloading the extension is not mistaken for a browser restart', async () =
   assert.equal(t2.state.startup, null);
   assert.equal(t2.rec(a).huntId, hunt);
   assert.equal(t2.state.resume, null);
+});
+
+test('recovery retries a failed Library write without re-archiving a page already brought back', async () => {
+  const t1 = await setup();
+  const urls = ['first', 'second', 'open'].map((name) => `https://example.com/${name}`);
+  for (const url of urls) await t1.open(url);
+  const browser = nextSession(t1.browser, { restore: [{ url: urls[2], active: true }] });
+  const t2 = await connect(browser);
+  await t2.engine.dispatch('startup');
+  browser.time += 3 * MIN;
+  const put = browser.repo.put;
+  browser.repo.put = async (store, item, ...args) => {
+    if (store === 'library' && item.url === urls[1]) throw new Error('write interrupted');
+    await put(store, item, ...args);
+  };
+  await assert.rejects(t2.engine.dispatch('tick'), /write interrupted/);
+  browser.repo.put = put;
+  const [first] = await t2.items();
+  assert.equal(first.url, urls[0]);
+  await t2.act('restore-item', { id: first.id });
+  await t2.use(1);
+  assert.equal(t2.state.startup, null);
+  assert.deepEqual((await t2.items()).map((item) => item.url), [urls[1]]);
 });
 
 test('a closed window waits a few minutes in case you reopen it', async () => {

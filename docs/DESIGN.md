@@ -32,7 +32,7 @@ chrome.* events ──► lib/wiring.js ──► Engine.dispatch(handler) ─�
   - `ledger`: action events.
   - `snapshots`: text snippets of open pages, by normalized URL. They used to sit in each tab record and made up most of every save.
 
-  State version 2 moves version 1's snippets out on first load.
+  State version 2 moves version 1's snippets out on first load. IndexedDB version 3 fills in normalized URL keys on older Library entries so that imports and address-bar lookups can find them through the same index.
 - **The content script** is deliberately small and passive. It answers questions (`ebb:capture`, `ebb:signals`, `ebb:link-info`), applies a scroll/media restore, reports unsaved typing, and shows toasts in a closed shadow root. All decisions are made in the service worker.
 - **The side panel** renders a view model from `Engine.viewModel()` and sends every action back as a message. It sets page titles and URLs as text only, and only accepts imported URLs that are `http(s)`.
 
@@ -93,7 +93,7 @@ Tab ids change when the browser restarts. They don't when Ebb itself is reloaded
 - **Yes:** the extension was reloaded. Ebb reconciles its records with the open tabs.
 - **No:** the browser restarted. All old records are set aside, keyed by normalized address, and for two minutes restored tabs are *adopted* by address, keeping their hunt and history. Tabs that were resting or shelved are unloaded again rather than left loading. Records nobody adopted go to the Library as *didn't come back after a restart*. A resume card lists the hunts.
 
-This doesn't depend on `runtime.onStartup` arriving before the first tab events; a late `onStartup` is ignored. If a second restart comes before the first adoption window was closed out, the first one's leftovers are saved first. When a window closes, its tabs' records wait five minutes in *limbo* in case the window is reopened. After that, the ones Ebb had tidied (resting or shelved) go to the Library. A Shelf tab the user closes by hand (or the whole Shelf group) goes to the Library right away.
+Recovery records the browser session marker so tab events and `runtime.onStartup` can arrive in either order. If Chrome restarts during adoption, the next session can match both the most recent tabs and records still waiting from the earlier session. Unmatched records go to the Library when the adoption window ends. A failed write leaves the remaining records available for the next tick. When a window closes, its tabs' records wait five minutes in *limbo* in case the window is reopened. After that, the ones Ebb had tidied (resting or shelved) go to the Library. A Shelf tab the user closes by hand (or the whole Shelf group) goes to the Library right away.
 
 **Chrome's saved tab groups.** Recent Chrome versions save every tab group, and sync them when signed in. A group whose last tab is *closed* stays behind as a saved group; a group whose last tab is *ungrouped* is deleted. So before closing the last Shelf tab, Ebb ungroups it. Closing a window that holds a Shelf is outside Ebb's control.
 

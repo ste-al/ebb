@@ -109,3 +109,20 @@ test('Done on a hunt in the panel tucks it away without a confirmation page', as
   for (const id of [s, ...results]) assert.equal(t.tab(id), null);
   assert.ok(t.tab(elsewhere));
 });
+
+for (const action of ['fresh-start', 'tuck-hunt']) {
+  test(`${action} keeps a draft first reported during the closing capture`, async () => {
+    const t = await setup();
+    const source = await t.open('https://example.com/story');
+    const draft = await t.background(source, 'https://example.com/compose');
+    const other = await t.background(source, 'https://example.com/related');
+    t.browser.type(draft);
+
+    const result = await t.act(action, { huntId: t.rec(source).huntId });
+    assert.ok(t.tab(draft));
+    assert.equal(t.rec(draft).dirty, true);
+    assert.equal(t.tab(other), null);
+    assert.equal(result.count, 1);
+    assert.deepEqual((await t.items()).map((item) => item.url), ['https://example.com/related']);
+  });
+}
